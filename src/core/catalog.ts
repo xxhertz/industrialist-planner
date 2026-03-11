@@ -58,8 +58,8 @@ export function validateCatalog(catalog: Catalog): string[] {
     if (recipe.durationSec <= 0n) {
       errors.push(`Recipe ${recipe.name} must have a positive duration.`);
     }
-    if (recipe.outputs.length === 0) {
-      errors.push(`Recipe ${recipe.name} must have at least one output.`);
+    if (recipe.inputs.length === 0 && recipe.outputs.length === 0) {
+      errors.push(`Recipe ${recipe.name} must have at least one input or output.`);
     }
     for (const output of recipe.outputs) {
       if (output.amount <= 0n) {
@@ -121,3 +121,5 @@ export function resolveItemByName(catalog: Catalog, raw: string): Item | undefin
     return item.aliases.some((alias) => alias.trim().toLowerCase() === normalized);
   });
 }
+
+

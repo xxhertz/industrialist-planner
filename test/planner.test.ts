@@ -5,7 +5,7 @@ import {
   planFactory,
   PlannerError,
 } from "../src/core/planner";
-import { getCompactItemLabel } from "../src/core/catalog";
+import { getCompactItemLabel, validateCatalog } from "../src/core/catalog";
 import { Catalog } from "../src/core/types";
 
 const steelCatalog: Catalog = {
@@ -161,6 +161,24 @@ describe("factory planner", () => {
     expect(rootSummary?.outputsPerSecond.map((output) => output.itemLabel)).toEqual(["steel", "steam"]);
   });
 
+  it("allows machines with inputs and no outputs in the catalog", () => {
+    const sinkCatalog: Catalog = {
+      schemaVersion: 1,
+      items: [{ id: "waste", name: "Waste", aliases: [] }],
+      recipes: [
+        {
+          id: "void-waste",
+          name: "Void Waste",
+          machineName: "Trash Burner",
+          durationSec: 1n,
+          inputs: [{ itemId: "waste", amount: 1n }],
+          outputs: [],
+        },
+      ],
+    };
+
+    expect(validateCatalog(sinkCatalog)).toEqual([]);
+  });
   it("prefers the shortest alias and falls back to the item name", () => {
     const aliasCatalog: Catalog = {
       schemaVersion: 1,
@@ -267,3 +285,4 @@ describe("factory planner", () => {
     ).toThrowError(PlannerError);
   });
 });
+

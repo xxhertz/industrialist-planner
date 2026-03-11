@@ -952,10 +952,10 @@ export class IndustrialistApp {
     }
 
     const outputsRaw = await this.promptInput(
-      "Outputs as item:amount, item:amount",
+      "Outputs as item:amount, item:amount (optional)",
       existing ? this.formatIngredients(existing.outputs) : "",
     );
-    if (!outputsRaw) {
+    if (outputsRaw === null) {
       return null;
     }
 
@@ -1042,6 +1042,8 @@ export function createAppWithDefaultStore(): IndustrialistApp {
     new ChecklistStore(path.join(process.cwd(), "data", "checklists.json")),
   );
 }
+
+
 
 
 
