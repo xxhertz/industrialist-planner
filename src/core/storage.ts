@@ -22,7 +22,7 @@ function serializeRecipe(recipe: Catalog["recipes"][number]): SerializedRecipe {
     machineName: recipe.machineName,
     durationSec: recipe.durationSec.toString(),
     inputs: recipe.inputs.map(serializeIngredient),
-    output: serializeIngredient(recipe.output),
+    outputs: recipe.outputs.map(serializeIngredient),
   };
 }
 
@@ -46,20 +46,23 @@ export function deserializeCatalog(serialized: SerializedCatalog): Catalog {
       name: item.name,
       aliases: [...item.aliases],
     })),
-    recipes: serialized.recipes.map((recipe) => ({
-      id: recipe.id,
-      name: recipe.name,
-      machineName: recipe.machineName,
-      durationSec: BigInt(recipe.durationSec),
-      inputs: recipe.inputs.map((input) => ({
-        itemId: input.itemId,
-        amount: BigInt(input.amount),
-      })),
-      output: {
-        itemId: recipe.output.itemId,
-        amount: BigInt(recipe.output.amount),
-      },
-    })),
+    recipes: serialized.recipes.map((recipe) => {
+      const outputs = recipe.outputs ?? (recipe.output ? [recipe.output] : []);
+      return {
+        id: recipe.id,
+        name: recipe.name,
+        machineName: recipe.machineName,
+        durationSec: BigInt(recipe.durationSec),
+        inputs: recipe.inputs.map((input) => ({
+          itemId: input.itemId,
+          amount: BigInt(input.amount),
+        })),
+        outputs: outputs.map((output) => ({
+          itemId: output.itemId,
+          amount: BigInt(output.amount),
+        })),
+      };
+    }),
   };
 }
 

@@ -3,6 +3,7 @@ import type { Widgets } from "blessed";
 import path from "node:path";
 import {
   createEmptyCatalog,
+  getCompactItemLabel,
   getItemById,
   getRecipeById,
   makeStableId,
@@ -15,9 +16,10 @@ import {
   planFactory,
   PlannerError,
   PlannerResult,
+  ProcessMachineRow,
 } from "../core/planner";
 import { CatalogStore } from "../core/storage";
-import { Catalog, Item, PlannerRequest, Recipe } from "../core/types";
+import { Catalog, Item, PlannerRequest, Recipe, RecipeIngredient } from "../core/types";
 
 type KeyBinding = {
   keys: string[];
@@ -25,6 +27,12 @@ type KeyBinding = {
 };
 
 type CatalogTab = "items" | "recipes";
+
+type PlannerChoice = {
+  recipeId: string;
+  outputItemId: string;
+  label: string;
+};
 
 export class IndustrialistApp {
   private readonly screen = blessed.screen({
@@ -108,9 +116,7 @@ export class IndustrialistApp {
   }
 
   private clearBody(): void {
-    this.body.children
-      .slice()
-      .forEach((child: Widgets.Node) => child.destroy());
+    this.body.children.slice().forEach((child: Widgets.Node) => child.destroy());
   }
 
   private async promptInput(label: string, initial = ""): Promise<string | null> {
@@ -340,11 +346,16 @@ export class IndustrialistApp {
         ]);
       } else {
         table.setData([
-          ["Recipe", "Machine", "Output", "Duration", "Inputs"],
+          ["Recipe", "Machine", "Outputs", "Duration", "Inputs"],
           ...this.catalog.recipes.map((recipe) => [
             recipe.name,
             recipe.machineName,
-            `${getItemById(this.catalog, recipe.output.itemId)?.name ?? recipe.output.itemId} x${recipe.output.amount.toString()}`,
+            recipe.outputs
+              .map(
+                (output) =>
+                  `${getItemById(this.catalog, output.itemId)?.name ?? output.itemId} x${output.amount.toString()}`,
+              )
+              .join(", "),
             `${recipe.durationSec.toString()}s`,
             recipe.inputs
               .map(
@@ -382,6 +393,12 @@ export class IndustrialistApp {
       }
     };
 
+    const syncTableSelection = () => {
+      if (getSelectedIndex() >= 0) {
+        table.select(getSelectedIndex() + 1);
+      }
+    };
+
     this.bindViewKey(["tab"], () => {
       this.currentTab = this.currentTab === "items" ? "recipes" : "items";
       this.showCatalog();
@@ -395,6 +412,7 @@ export class IndustrialistApp {
         await this.addRecipe();
       }
       render();
+      syncTableSelection();
     });
     this.bindViewKey(["e"], async () => {
       if (this.currentTab === "items") {
@@ -409,9 +427,7 @@ export class IndustrialistApp {
         }
       }
       render();
-      if (getSelectedIndex() >= 0) {
-        table.select(getSelectedIndex() + 1);
-      }
+      syncTableSelection();
     });
     this.bindViewKey(["d"], async () => {
       if (this.currentTab === "items") {
@@ -426,9 +442,7 @@ export class IndustrialistApp {
         }
       }
       render();
-      if (getSelectedIndex() >= 0) {
-        table.select(getSelectedIndex() + 1);
-      }
+      syncTableSelection();
     });
     table.key(["enter"], async () => {
       if (this.currentTab === "items") {
@@ -443,9 +457,7 @@ export class IndustrialistApp {
         }
       }
       render();
-      if (getSelectedIndex() >= 0) {
-        table.select(getSelectedIndex() + 1);
-      }
+      syncTableSelection();
     });
 
     table.on("select", (_item: Widgets.BlessedElement, index: number) => {
@@ -453,10 +465,18 @@ export class IndustrialistApp {
     });
 
     render();
-    if (getSelectedIndex() >= 0) {
-      table.select(getSelectedIndex() + 1);
-    }
+    syncTableSelection();
     table.focus();
+  }
+
+  private getPlannerChoices(): PlannerChoice[] {
+    return this.catalog.recipes.flatMap((recipe) =>
+      recipe.outputs.map((output) => ({
+        recipeId: recipe.id,
+        outputItemId: output.itemId,
+        label: `${getCompactItemLabel(this.catalog, output.itemId)} via ${recipe.name}`,
+      })),
+    );
   }
 
   private showPlannerView(): void {
@@ -471,9 +491,10 @@ export class IndustrialistApp {
       width: "100%-4",
       height: 4,
       content:
-        "Select the end recipe you want to plan around. The wizard will ask for either machine count or target output per second, then resolve alternative upstream recipes if needed.",
+        "Select the output you want to plan around. The wizard will ask for either machine count or target output per second, then resolve alternative upstream recipes if needed.",
     });
 
+    const plannerChoices = this.getPlannerChoices();
     const list = blessed.list({
       parent: this.body,
       top: 6,
@@ -484,9 +505,7 @@ export class IndustrialistApp {
       keys: true,
       vi: true,
       mouse: true,
-      items: this.catalog.recipes.map(
-        (recipe) => `${recipe.name} -> ${getItemById(this.catalog, recipe.output.itemId)?.name ?? recipe.output.itemId}`,
-      ),
+      items: plannerChoices.map((choice) => choice.label),
       style: {
         selected: {
           bg: "blue",
@@ -495,13 +514,15 @@ export class IndustrialistApp {
     });
 
     const run = async () => {
-      const recipe = this.catalog.recipes[
-        (list as unknown as { selected: number }).selected ?? 0
-      ];
+      const choice = plannerChoices[(list as unknown as { selected: number }).selected ?? 0];
+      if (!choice) {
+        return;
+      }
+      const recipe = getRecipeById(this.catalog, choice.recipeId);
       if (!recipe) {
         return;
       }
-      await this.runPlannerWizard(recipe);
+      await this.runPlannerWizard(recipe, choice.outputItemId);
     };
 
     this.bindViewKey(["q"], () => this.showHome());
@@ -513,7 +534,7 @@ export class IndustrialistApp {
     this.screen.render();
   }
 
-  private async runPlannerWizard(rootRecipe: Recipe): Promise<void> {
+  private async runPlannerWizard(rootRecipe: Recipe, rootOutputItemId: string): Promise<void> {
     const targetModeIndex = await this.promptChoice("Target mode", [
       "Machine count",
       "Output per second",
@@ -535,6 +556,7 @@ export class IndustrialistApp {
 
     const request: PlannerRequest = {
       rootRecipeId: rootRecipe.id,
+      rootOutputItemId,
       targetMode,
       targetValue,
       recipeSelections: {},
@@ -587,7 +609,7 @@ export class IndustrialistApp {
       height: 4,
       tags: true,
       content:
-        `{bold}${rootRecipe?.name ?? result.rootRecipeId}{/bold}\n` +
+        `{bold}${rootRecipe?.name ?? result.rootRecipeId}{/bold} for {bold}${result.rootOutputItemLabel}{/bold}\n` +
         `Scale factor: ${result.scaleFactor.toString()}\n` +
         `Achieved output: ${formatRate(result.achievedOutputPerSecond)}`,
     });
@@ -599,16 +621,26 @@ export class IndustrialistApp {
       width: "60%",
       height: "50%-2",
       border: "line",
-      label: " Machine Counts ",
+      label: " Process Order ",
       data: [
-        ["Recipe", "Machine", "Exact", "Scaled", "Output/sec"],
-        ...result.recipeSummaries.map((summary) => [
-          summary.recipeName,
-          summary.machineName,
-          summary.exactMachineCount.toFractionString(),
-          summary.scaledMachineCount.toString(),
-          summary.outputPerSecond.toDecimalString(4),
-        ]),
+        ["Machine", "Item", "Exact", "Scaled", "Rate/sec"],
+        ...result.processRows.map((row) =>
+          row.kind === "machine"
+            ? [
+                row.machineName,
+                this.formatProcessItem(row),
+                row.exactMachineCount.toFractionString(),
+                row.scaledMachineCount.toString(),
+                row.outputPerSecond.toDecimalString(4),
+              ]
+            : [
+                "",
+                row.itemLabel,
+                row.exactRate.toFractionString(),
+                row.scaledRate.toDecimalString(4),
+                "external",
+              ],
+        ),
       ],
       style: {
         header: {
@@ -629,7 +661,7 @@ export class IndustrialistApp {
       data: [
         ["Item", "Exact/sec", "Scaled/sec"],
         ...result.externalSources.map((source) => [
-          source.itemName,
+          source.itemLabel,
           source.exactRate.toFractionString(),
           source.scaledRate.toDecimalString(4),
         ]),
@@ -663,42 +695,58 @@ export class IndustrialistApp {
     this.screen.render();
   }
 
+  private formatProcessItem(row: ProcessMachineRow): string {
+    if (row.byproducts.length === 0) {
+      return row.itemLabel;
+    }
+    return `${row.itemLabel} (+${row.byproducts.map((byproduct) => byproduct.itemLabel).join(", ")})`;
+  }
+
   private renderDependencyTree(result: PlannerResult): string {
     const lines: string[] = [];
     const visited = new Set<string>();
 
-    const visit = (recipeId: string, depth: number) => {
+    const visit = (recipeId: string, depth: number, displayItemId: string) => {
       const recipe = getRecipeById(this.catalog, recipeId);
       const summary = result.recipeSummaries.find((entry) => entry.recipeId === recipeId);
       if (!recipe || !summary) {
         return;
       }
 
+      const output =
+        summary.outputsPerSecond.find((entry) => entry.itemId === displayItemId) ??
+        summary.outputsPerSecond[0];
+      const byproducts = summary.outputsPerSecond
+        .filter((entry) => entry.itemId !== output.itemId)
+        .map((entry) => entry.itemLabel);
+
       const indent = "  ".repeat(depth);
-      lines.push(`${indent}${recipe.name} [${summary.scaledMachineCount.toString()} ${recipe.machineName}]`);
+      lines.push(
+        `${indent}${recipe.machineName} [${output.itemLabel}${byproducts.length > 0 ? ` + ${byproducts.join(", ")}` : ""}] x${summary.scaledMachineCount.toString()}`,
+      );
 
       for (const edge of result.dependencyGraph[recipeId] ?? []) {
         const itemIndent = "  ".repeat(depth + 1);
         if (!edge.producerRecipeId) {
           const external = result.externalSources.find((source) => source.itemId === edge.itemId);
           lines.push(
-            `${itemIndent}${edge.itemName}: external ${
+            `${itemIndent}${getCompactItemLabel(this.catalog, edge.itemId)}: external ${
               external ? external.scaledRate.toDecimalString(4) : "0"
             }/s`,
           );
           continue;
         }
 
-        lines.push(`${itemIndent}${edge.itemName}`);
-        const key = `${recipeId}->${edge.producerRecipeId}`;
+        lines.push(`${itemIndent}${getCompactItemLabel(this.catalog, edge.itemId)}`);
+        const key = `${recipeId}->${edge.producerRecipeId}:${edge.itemId}`;
         if (!visited.has(key)) {
           visited.add(key);
-          visit(edge.producerRecipeId, depth + 2);
+          visit(edge.producerRecipeId, depth + 2, edge.itemId);
         }
       }
     };
 
-    visit(result.rootRecipeId, 0);
+    visit(result.rootRecipeId, 0, result.rootOutputItemId);
     return lines.join("\n");
   }
 
@@ -741,7 +789,8 @@ export class IndustrialistApp {
   private async deleteItem(item: Item): Promise<void> {
     const used = this.catalog.recipes.some(
       (recipe) =>
-        recipe.output.itemId === item.id || recipe.inputs.some((input) => input.itemId === item.id),
+        recipe.outputs.some((output) => output.itemId === item.id) ||
+        recipe.inputs.some((input) => input.itemId === item.id),
     );
     if (used) {
       await this.showMessage("Cannot Delete", "This item is still used by one or more recipes.");
@@ -756,7 +805,7 @@ export class IndustrialistApp {
 
   private async addRecipe(): Promise<void> {
     if (this.catalog.items.length === 0) {
-      await this.showMessage("No Items", "Create items first so recipe inputs can reference them.");
+      await this.showMessage("No Items", "Create items first so recipe ingredients can reference them.");
       return;
     }
 
@@ -782,7 +831,7 @@ export class IndustrialistApp {
     recipe.machineName = fields.machineName;
     recipe.durationSec = fields.durationSec;
     recipe.inputs = fields.inputs;
-    recipe.output = fields.output;
+    recipe.outputs = fields.outputs;
     this.persistCatalog();
   }
 
@@ -811,32 +860,17 @@ export class IndustrialistApp {
       return null;
     }
 
-    const outputItemRaw = await this.promptInput(
-      "Output item name or alias",
-      existing ? getItemById(this.catalog, existing.output.itemId)?.name ?? "" : "",
+    const outputsRaw = await this.promptInput(
+      "Outputs as item:amount, item:amount",
+      existing ? this.formatIngredients(existing.outputs) : "",
     );
-    if (!outputItemRaw) {
-      return null;
-    }
-
-    const outputAmountRaw = await this.promptInput(
-      "Output amount",
-      existing?.output.amount.toString() ?? "1",
-    );
-    if (!outputAmountRaw) {
+    if (!outputsRaw) {
       return null;
     }
 
     const inputsRaw = await this.promptInput(
       "Inputs as item:amount, item:amount",
-      existing
-        ? existing.inputs
-            .map(
-              (input) =>
-                `${getItemById(this.catalog, input.itemId)?.name ?? input.itemId}:${input.amount.toString()}`,
-            )
-            .join(", ")
-        : "",
+      existing ? this.formatIngredients(existing.inputs) : "",
     );
     if (inputsRaw === null) {
       return null;
@@ -844,24 +878,16 @@ export class IndustrialistApp {
 
     try {
       const durationSec = BigInt(durationRaw);
-      const outputAmount = BigInt(outputAmountRaw);
-      if (durationSec <= 0n || outputAmount <= 0n) {
-        throw new Error("Duration and output amount must be positive.");
-      }
-      const outputItem = resolveItemByName(this.catalog, outputItemRaw);
-      if (!outputItem) {
-        throw new Error(`Unknown output item "${outputItemRaw}".`);
+      if (durationSec <= 0n) {
+        throw new Error("Duration must be positive.");
       }
 
       return {
         name,
         machineName,
         durationSec,
-        output: {
-          itemId: outputItem.id,
-          amount: outputAmount,
-        },
-        inputs: this.parseRecipeInputs(inputsRaw),
+        outputs: this.parseIngredientList(outputsRaw, "output"),
+        inputs: this.parseIngredientList(inputsRaw, "input"),
       };
     } catch (error) {
       await this.showMessage("Invalid Recipe", (error as Error).message);
@@ -869,14 +895,24 @@ export class IndustrialistApp {
     }
   }
 
-  private parseRecipeInputs(raw: string): Recipe["inputs"] {
+  private formatIngredients(ingredients: RecipeIngredient[]): string {
+    return ingredients
+      .map(
+        (ingredient) =>
+          `${getItemById(this.catalog, ingredient.itemId)?.name ?? ingredient.itemId}:${ingredient.amount.toString()}`,
+      )
+      .join(", ");
+  }
+
+  private parseIngredientList(raw: string, label: string): RecipeIngredient[] {
     if (!raw.trim()) {
       return [];
     }
+
     return raw.split(",").map((chunk) => {
       const [itemToken, amountToken] = chunk.split(":");
       if (!itemToken || !amountToken) {
-        throw new Error(`Invalid input "${chunk.trim()}". Use item:amount.`);
+        throw new Error(`Invalid ${label} "${chunk.trim()}". Use item:amount.`);
       }
       const item = resolveItemByName(this.catalog, itemToken);
       if (!item) {
@@ -884,7 +920,7 @@ export class IndustrialistApp {
       }
       const amount = BigInt(amountToken.trim());
       if (amount <= 0n) {
-        throw new Error(`Input amount for "${item.name}" must be positive.`);
+        throw new Error(`${label[0].toUpperCase()}${label.slice(1)} amount for "${item.name}" must be positive.`);
       }
       return {
         itemId: item.id,

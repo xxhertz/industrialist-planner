@@ -1,4 +1,5 @@
 import {
+  getCompactItemLabel,
   getItemById,
   getRecipeById,
   getRecipeProducers,
@@ -24,16 +25,24 @@ export class CycleDetectedError extends PlannerError {
   }
 }
 
+export interface OutputRateSummary {
+  itemId: ItemId;
+  itemName: string;
+  itemLabel: string;
+  rate: Rational;
+}
+
 export interface RecipePlanSummary {
   recipeId: RecipeId;
   recipeName: string;
   machineName: string;
   exactMachineCount: Rational;
   scaledMachineCount: bigint;
-  outputPerSecond: Rational;
+  outputsPerSecond: OutputRateSummary[];
   inputsPerSecond: Array<{
     itemId: ItemId;
     itemName: string;
+    itemLabel: string;
     rate: Rational;
   }>;
 }
@@ -41,6 +50,7 @@ export interface RecipePlanSummary {
 export interface ExternalSourceSummary {
   itemId: ItemId;
   itemName: string;
+  itemLabel: string;
   exactRate: Rational;
   scaledRate: Rational;
 }
@@ -51,18 +61,56 @@ export interface DependencyEdge {
   producerRecipeId?: RecipeId;
 }
 
+export interface ProcessMachineRow {
+  kind: "machine";
+  recipeId: RecipeId;
+  recipeName: string;
+  machineName: string;
+  itemId: ItemId;
+  itemLabel: string;
+  exactMachineCount: Rational;
+  scaledMachineCount: bigint;
+  outputPerSecond: Rational;
+  byproducts: Array<{
+    itemId: ItemId;
+    itemLabel: string;
+    rate: Rational;
+  }>;
+}
+
+export interface ProcessSourceRow {
+  kind: "source";
+  itemId: ItemId;
+  itemLabel: string;
+  exactRate: Rational;
+  scaledRate: Rational;
+}
+
+export type ProcessRow = ProcessMachineRow | ProcessSourceRow;
+
 export interface PlannerResult {
   rootRecipeId: RecipeId;
+  rootOutputItemId: ItemId;
+  rootOutputItemLabel: string;
   scaleFactor: bigint;
   achievedOutputPerSecond: Rational;
   recipeSummaries: RecipePlanSummary[];
   externalSources: ExternalSourceSummary[];
   dependencyGraph: Record<RecipeId, DependencyEdge[]>;
+  processRows: ProcessRow[];
   selections: Record<ItemId, RecipeId>;
 }
 
-function getOutputRatePerMachine(recipe: Recipe): Rational {
-  return new Rational(recipe.output.amount, recipe.durationSec);
+function getRecipeOutput(recipe: Recipe, itemId: ItemId) {
+  return recipe.outputs.find((output) => output.itemId === itemId);
+}
+
+function getOutputRatePerMachine(recipe: Recipe, outputItemId: ItemId): Rational {
+  const output = getRecipeOutput(recipe, outputItemId);
+  if (!output) {
+    throw new PlannerError(`Recipe ${recipe.name} does not produce ${outputItemId}.`);
+  }
+  return new Rational(output.amount, recipe.durationSec);
 }
 
 function getInputRatePerMachine(recipe: Recipe, itemId: ItemId): Rational {
@@ -97,9 +145,7 @@ function resolveProducer(
   if (selectedRecipeId) {
     const recipe = available.find((entry) => entry.id === selectedRecipeId);
     if (!recipe) {
-      throw new PlannerError(
-        `Selected recipe ${selectedRecipeId} does not produce ${itemId}.`,
-      );
+      throw new PlannerError(`Selected recipe ${selectedRecipeId} does not produce ${itemId}.`);
     }
     return recipe;
   }
@@ -150,6 +196,84 @@ function detectCycles(
   visited.add(recipeId);
 }
 
+function buildProcessRows(
+  rootRecipeId: RecipeId,
+  rootOutputItemId: ItemId,
+  dependencyGraph: Record<RecipeId, DependencyEdge[]>,
+  recipeSummaries: RecipePlanSummary[],
+  externalSources: ExternalSourceSummary[],
+): ProcessRow[] {
+  const processRows: ProcessRow[] = [];
+  const summaryByRecipeId = new Map(recipeSummaries.map((summary) => [summary.recipeId, summary]));
+  const sourceByItemId = new Map(externalSources.map((source) => [source.itemId, source]));
+  const visitedRecipes = new Set<string>();
+  const visitedSources = new Set<ItemId>();
+
+  const visitRecipe = (recipeId: RecipeId, displayItemId: ItemId) => {
+    const visitKey = `${recipeId}:${displayItemId}`;
+    if (visitedRecipes.has(visitKey)) {
+      return;
+    }
+    visitedRecipes.add(visitKey);
+
+    const summary = summaryByRecipeId.get(recipeId);
+    if (!summary) {
+      return;
+    }
+
+    const mainOutput =
+      summary.outputsPerSecond.find((output) => output.itemId === displayItemId) ??
+      summary.outputsPerSecond[0];
+
+    processRows.push({
+      kind: "machine",
+      recipeId: summary.recipeId,
+      recipeName: summary.recipeName,
+      machineName: summary.machineName,
+      itemId: mainOutput.itemId,
+      itemLabel: mainOutput.itemLabel,
+      exactMachineCount: summary.exactMachineCount,
+      scaledMachineCount: summary.scaledMachineCount,
+      outputPerSecond: mainOutput.rate,
+      byproducts: summary.outputsPerSecond
+        .filter((output) => output.itemId !== mainOutput.itemId)
+        .map((output) => ({
+          itemId: output.itemId,
+          itemLabel: output.itemLabel,
+          rate: output.rate,
+        })),
+    });
+
+    for (const edge of dependencyGraph[recipeId] ?? []) {
+      if (edge.producerRecipeId) {
+        visitRecipe(edge.producerRecipeId, edge.itemId);
+        continue;
+      }
+
+      if (visitedSources.has(edge.itemId)) {
+        continue;
+      }
+
+      const source = sourceByItemId.get(edge.itemId);
+      if (!source) {
+        continue;
+      }
+
+      visitedSources.add(edge.itemId);
+      processRows.push({
+        kind: "source",
+        itemId: source.itemId,
+        itemLabel: source.itemLabel,
+        exactRate: source.exactRate,
+        scaledRate: source.scaledRate,
+      });
+    }
+  };
+
+  visitRecipe(rootRecipeId, rootOutputItemId);
+  return processRows;
+}
+
 export function planFactory(catalog: Catalog, request: PlannerRequest): PlannerResult {
   const catalogErrors = validateCatalog(catalog);
   if (catalogErrors.length > 0) {
@@ -159,6 +283,11 @@ export function planFactory(catalog: Catalog, request: PlannerRequest): PlannerR
   const rootRecipe = getRecipeById(catalog, request.rootRecipeId);
   if (!rootRecipe) {
     throw new PlannerError(`Unknown root recipe: ${request.rootRecipeId}`);
+  }
+  if (!getRecipeOutput(rootRecipe, request.rootOutputItemId)) {
+    throw new PlannerError(
+      `Root recipe ${rootRecipe.name} does not produce ${request.rootOutputItemId}.`,
+    );
   }
 
   const targetValue = Rational.parse(request.targetValue);
@@ -177,7 +306,7 @@ export function planFactory(catalog: Catalog, request: PlannerRequest): PlannerR
   const rootMachineCount =
     request.targetMode === "machineCount"
       ? targetValue
-      : targetValue.div(getOutputRatePerMachine(rootRecipe));
+      : targetValue.div(getOutputRatePerMachine(rootRecipe, request.rootOutputItemId));
 
   addToMachineMap(recipeMachines, rootRecipe.id, rootMachineCount);
   dependencyGraph.set(rootRecipe.id, new Map<ItemId, DependencyEdge>());
@@ -206,8 +335,7 @@ export function planFactory(catalog: Catalog, request: PlannerRequest): PlannerR
       }
 
       resolvedSelections[itemId] = producer.id;
-      const outputRatePerMachine = getOutputRatePerMachine(producer);
-      const machineCount = demandRate.div(outputRatePerMachine);
+      const machineCount = demandRate.div(getOutputRatePerMachine(producer, itemId));
       addToMachineMap(recipeMachines, producer.id, machineCount);
 
       if (!dependencyGraph.has(producer.id)) {
@@ -241,53 +369,65 @@ export function planFactory(catalog: Catalog, request: PlannerRequest): PlannerR
   }
 
   const scaledFactor = Rational.fromBigInt(scaleFactor);
-  const recipeSummaries = [...recipeMachines.entries()]
-    .map(([recipeId, exactMachineCount]) => {
-      const recipe = getRecipeById(catalog, recipeId);
-      if (!recipe) {
-        throw new PlannerError(`Unknown recipe id in result: ${recipeId}`);
-      }
+  const recipeSummaries = [...recipeMachines.entries()].map(([recipeId, exactMachineCount]) => {
+    const recipe = getRecipeById(catalog, recipeId);
+    if (!recipe) {
+      throw new PlannerError(`Unknown recipe id in result: ${recipeId}`);
+    }
 
-      const scaledMachineCount = exactMachineCount.mul(scaledFactor);
-      return {
-        recipeId,
-        recipeName: recipe.name,
-        machineName: recipe.machineName,
-        exactMachineCount,
-        scaledMachineCount: scaledMachineCount.numerator,
-        outputPerSecond: getOutputRatePerMachine(recipe).mul(scaledMachineCount),
-        inputsPerSecond: recipe.inputs.map((input) => ({
-          itemId: input.itemId,
-          itemName: getItemById(catalog, input.itemId)?.name ?? input.itemId,
-          rate: new Rational(input.amount, recipe.durationSec).mul(scaledMachineCount),
-        })),
-      };
-    })
-    .sort((left, right) => left.recipeName.localeCompare(right.recipeName));
+    const scaledMachineCount = exactMachineCount.mul(scaledFactor);
+    return {
+      recipeId,
+      recipeName: recipe.name,
+      machineName: recipe.machineName,
+      exactMachineCount,
+      scaledMachineCount: scaledMachineCount.numerator,
+      outputsPerSecond: recipe.outputs.map((output) => ({
+        itemId: output.itemId,
+        itemName: getItemById(catalog, output.itemId)?.name ?? output.itemId,
+        itemLabel: getCompactItemLabel(catalog, output.itemId),
+        rate: new Rational(output.amount, recipe.durationSec).mul(scaledMachineCount),
+      })),
+      inputsPerSecond: recipe.inputs.map((input) => ({
+        itemId: input.itemId,
+        itemName: getItemById(catalog, input.itemId)?.name ?? input.itemId,
+        itemLabel: getCompactItemLabel(catalog, input.itemId),
+        rate: new Rational(input.amount, recipe.durationSec).mul(scaledMachineCount),
+      })),
+    };
+  });
 
-  const externalSourceSummaries = [...externalSources.entries()]
-    .map(([itemId, exactRate]) => ({
-      itemId,
-      itemName: getItemById(catalog, itemId)?.name ?? itemId,
-      exactRate,
-      scaledRate: exactRate.mul(scaledFactor),
-    }))
-    .sort((left, right) => left.itemName.localeCompare(right.itemName));
+  const externalSourceSummaries = [...externalSources.entries()].map(([itemId, exactRate]) => ({
+    itemId,
+    itemName: getItemById(catalog, itemId)?.name ?? itemId,
+    itemLabel: getCompactItemLabel(catalog, itemId),
+    exactRate,
+    scaledRate: exactRate.mul(scaledFactor),
+  }));
 
   const serializedGraph: Record<RecipeId, DependencyEdge[]> = {};
   for (const [recipeId, edges] of dependencyGraph.entries()) {
-    serializedGraph[recipeId] = [...edges.values()].sort((left, right) =>
-      left.itemName.localeCompare(right.itemName),
-    );
+    serializedGraph[recipeId] = [...edges.values()];
   }
 
   return {
     rootRecipeId: rootRecipe.id,
+    rootOutputItemId: request.rootOutputItemId,
+    rootOutputItemLabel: getCompactItemLabel(catalog, request.rootOutputItemId),
     scaleFactor,
-    achievedOutputPerSecond: getOutputRatePerMachine(rootRecipe).mul(rootMachineCount).mul(scaledFactor),
+    achievedOutputPerSecond: getOutputRatePerMachine(rootRecipe, request.rootOutputItemId)
+      .mul(rootMachineCount)
+      .mul(scaledFactor),
     recipeSummaries,
     externalSources: externalSourceSummaries,
     dependencyGraph: serializedGraph,
+    processRows: buildProcessRows(
+      rootRecipe.id,
+      request.rootOutputItemId,
+      serializedGraph,
+      recipeSummaries,
+      externalSourceSummaries,
+    ),
     selections: resolvedSelections,
   };
 }

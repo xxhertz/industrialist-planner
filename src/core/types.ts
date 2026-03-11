@@ -18,7 +18,7 @@ export interface Recipe {
   machineName: string;
   durationSec: bigint;
   inputs: RecipeIngredient[];
-  output: RecipeIngredient;
+  outputs: RecipeIngredient[];
 }
 
 export interface Catalog {
@@ -29,6 +29,7 @@ export interface Catalog {
 
 export interface PlannerRequest {
   rootRecipeId: RecipeId;
+  rootOutputItemId: ItemId;
   targetMode: "machineCount" | "outputPerSecond";
   targetValue: string;
   recipeSelections: Record<ItemId, RecipeId>;
@@ -51,7 +52,8 @@ export interface SerializedRecipe {
   machineName: string;
   durationSec: string;
   inputs: SerializedRecipeIngredient[];
-  output: SerializedRecipeIngredient;
+  outputs?: SerializedRecipeIngredient[];
+  output?: SerializedRecipeIngredient;
 }
 
 export interface SerializedCatalog {

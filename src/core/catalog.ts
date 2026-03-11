@@ -58,11 +58,16 @@ export function validateCatalog(catalog: Catalog): string[] {
     if (recipe.durationSec <= 0n) {
       errors.push(`Recipe ${recipe.name} must have a positive duration.`);
     }
-    if (recipe.output.amount <= 0n) {
-      errors.push(`Recipe ${recipe.name} must have a positive output amount.`);
+    if (recipe.outputs.length === 0) {
+      errors.push(`Recipe ${recipe.name} must have at least one output.`);
     }
-    if (!itemIds.has(recipe.output.itemId)) {
-      errors.push(`Recipe ${recipe.name} output item does not exist.`);
+    for (const output of recipe.outputs) {
+      if (output.amount <= 0n) {
+        errors.push(`Recipe ${recipe.name} has a non-positive output amount.`);
+      }
+      if (!itemIds.has(output.itemId)) {
+        errors.push(`Recipe ${recipe.name} output item does not exist.`);
+      }
     }
     for (const input of recipe.inputs) {
       if (input.amount <= 0n) {
@@ -81,12 +86,30 @@ export function getItemById(catalog: Catalog, itemId: ItemId): Item | undefined 
   return catalog.items.find((item) => item.id === itemId);
 }
 
+export function getCompactItemLabel(catalog: Catalog, itemId: ItemId): string {
+  const item = getItemById(catalog, itemId);
+  if (!item) {
+    return itemId;
+  }
+
+  const aliases = item.aliases.map((alias) => alias.trim()).filter(Boolean);
+  if (aliases.length === 0) {
+    return item.name;
+  }
+
+  return aliases.reduce((shortest, current) =>
+    current.length < shortest.length ? current : shortest,
+  );
+}
+
 export function getRecipeById(catalog: Catalog, recipeId: RecipeId): Recipe | undefined {
   return catalog.recipes.find((recipe) => recipe.id === recipeId);
 }
 
 export function getRecipeProducers(catalog: Catalog, itemId: ItemId): Recipe[] {
-  return catalog.recipes.filter((recipe) => recipe.output.itemId === itemId);
+  return catalog.recipes.filter((recipe) =>
+    recipe.outputs.some((output) => output.itemId === itemId),
+  );
 }
 
 export function resolveItemByName(catalog: Catalog, raw: string): Item | undefined {
