@@ -61,3 +61,17 @@ export interface SerializedCatalog {
   items: SerializedItem[];
   recipes: SerializedRecipe[];
 }
+
+export type ResultChecklistKey = string;
+
+export interface SerializedChecklistEntry {
+  resultKey: ResultChecklistKey;
+  itemIds: string[];
+  checkedItemIds: string[];
+  updatedAt: string;
+}
+
+export interface SerializedChecklistCollection {
+  entries: SerializedChecklistEntry[];
+}
+

@@ -2,6 +2,11 @@ import blessed from "blessed";
 import type { Widgets } from "blessed";
 import path from "node:path";
 import {
+  buildChecklistEntry,
+  buildChecklistItems,
+  createChecklistResultKey,
+} from "../core/checklist";
+import {
   createEmptyCatalog,
   getCompactItemLabel,
   getItemById,
@@ -18,7 +23,7 @@ import {
   PlannerResult,
   ProcessMachineRow,
 } from "../core/planner";
-import { CatalogStore } from "../core/storage";
+import { CatalogStore, ChecklistStore } from "../core/storage";
 import { Catalog, Item, PlannerRequest, Recipe, RecipeIngredient } from "../core/types";
 
 type KeyBinding = {
@@ -80,10 +85,13 @@ export class IndustrialistApp {
     recipes: 0,
   };
 
-  constructor(private readonly store: CatalogStore) {}
+  constructor(
+    private readonly catalogStore: CatalogStore,
+    private readonly checklistStore: ChecklistStore,
+  ) {}
 
   async start(): Promise<void> {
-    this.catalog = this.store.load();
+    this.catalog = this.catalogStore.load();
     this.screen.key(["C-c"], () => {
       this.screen.destroy();
       process.exit(0);
@@ -598,8 +606,13 @@ export class IndustrialistApp {
   private showResults(result: PlannerResult): void {
     this.clearViewBindings();
     this.clearBody();
-    this.setChrome("Results", "q home  p planner");
+    this.setChrome(
+      "Results",
+      "up/down move  space/enter toggle  a all  x clear  p planner  q home",
+    );
 
+    const resultKey = createChecklistResultKey(result);
+    let checklistItems = buildChecklistItems(result, this.checklistStore.load(resultKey));
     const rootRecipe = getRecipeById(this.catalog, result.rootRecipeId);
     blessed.box({
       parent: this.body,
@@ -674,11 +687,29 @@ export class IndustrialistApp {
       },
     });
 
-    blessed.box({
+    const checklist = blessed.list({
       parent: this.body,
       top: "50%+2",
       left: 0,
-      width: "100%",
+      width: "42%",
+      height: "50%-2",
+      border: "line",
+      label: " Checklist ",
+      keys: true,
+      vi: true,
+      mouse: true,
+      style: {
+        selected: {
+          bg: "blue",
+        },
+      },
+    });
+
+    blessed.box({
+      parent: this.body,
+      top: "50%+2",
+      left: "42%",
+      width: "58%",
       height: "50%-2",
       border: "line",
       label: " Dependency Tree ",
@@ -690,9 +721,69 @@ export class IndustrialistApp {
       content: this.renderDependencyTree(result),
     });
 
+    const getSelectedChecklistIndex = () =>
+      Math.max(
+        0,
+        Math.min(
+          (checklist as unknown as { selected?: number }).selected ?? 0,
+          Math.max(checklistItems.length - 1, 0),
+        ),
+      );
+
+    const persistChecklist = () => {
+      if (checklistItems.every((item) => !item.checked)) {
+        this.checklistStore.remove(resultKey);
+        return;
+      }
+
+      this.checklistStore.save(buildChecklistEntry(resultKey, checklistItems));
+    };
+
+    const renderChecklist = () => {
+      const completedCount = checklistItems.filter((item) => item.checked).length;
+      checklist.setLabel(` Checklist ${completedCount}/${checklistItems.length} `);
+      checklist.setItems(
+        checklistItems.map((item) => `${item.checked ? "[x]" : "[ ]"} ${item.label}`),
+      );
+      if (checklistItems.length > 0) {
+        checklist.select(getSelectedChecklistIndex());
+      }
+      this.screen.render();
+    };
+
+    const toggleSelectedChecklistItem = () => {
+      if (checklistItems.length === 0) {
+        return;
+      }
+
+      const selectedIndex = getSelectedChecklistIndex();
+      checklistItems = checklistItems.map((item, index) =>
+        index === selectedIndex ? { ...item, checked: !item.checked } : item,
+      );
+      persistChecklist();
+      renderChecklist();
+      checklist.focus();
+    };
+
+    const setAllChecklistItems = (checked: boolean) => {
+      if (checklistItems.length === 0) {
+        return;
+      }
+
+      checklistItems = checklistItems.map((item) => ({ ...item, checked }));
+      persistChecklist();
+      renderChecklist();
+      checklist.focus();
+    };
+
     this.bindViewKey(["q"], () => this.showHome());
     this.bindViewKey(["p"], () => this.showPlannerView());
-    this.screen.render();
+    this.bindViewKey(["space", "enter"], () => toggleSelectedChecklistItem());
+    this.bindViewKey(["a"], () => setAllChecklistItems(true));
+    this.bindViewKey(["x"], () => setAllChecklistItems(false));
+
+    renderChecklist();
+    checklist.focus();
   }
 
   private formatProcessItem(row: ProcessMachineRow): string {
@@ -934,7 +1025,7 @@ export class IndustrialistApp {
     if (errors.length > 0) {
       throw new Error(errors[0]);
     }
-    this.store.save(this.catalog);
+    this.catalogStore.save(this.catalog);
   }
 }
 
@@ -946,5 +1037,12 @@ function parseAliases(raw: string): string[] {
 }
 
 export function createAppWithDefaultStore(): IndustrialistApp {
-  return new IndustrialistApp(new CatalogStore(path.join(process.cwd(), "data", "catalog.json")));
+  return new IndustrialistApp(
+    new CatalogStore(path.join(process.cwd(), "data", "catalog.json")),
+    new ChecklistStore(path.join(process.cwd(), "data", "checklists.json")),
+  );
 }
+
+
+
+

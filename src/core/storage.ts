@@ -3,7 +3,10 @@ import path from "node:path";
 import { createEmptyCatalog } from "./catalog";
 import {
   Catalog,
+  ResultChecklistKey,
   SerializedCatalog,
+  SerializedChecklistCollection,
+  SerializedChecklistEntry,
   SerializedRecipe,
   SerializedRecipeIngredient,
 } from "./types";
@@ -66,19 +69,25 @@ export function deserializeCatalog(serialized: SerializedCatalog): Catalog {
   };
 }
 
+function createEmptyChecklistCollection(): SerializedChecklistCollection {
+  return {
+    entries: [],
+  };
+}
+
+function ensureJsonFile<T>(filePath: string, defaultValue: T): void {
+  const directory = path.dirname(filePath);
+  fs.mkdirSync(directory, { recursive: true });
+  if (!fs.existsSync(filePath)) {
+    fs.writeFileSync(filePath, JSON.stringify(defaultValue, null, 2), "utf8");
+  }
+}
+
 export class CatalogStore {
   constructor(private readonly filePath: string) {}
 
   ensureFile(): void {
-    const directory = path.dirname(this.filePath);
-    fs.mkdirSync(directory, { recursive: true });
-    if (!fs.existsSync(this.filePath)) {
-      fs.writeFileSync(
-        this.filePath,
-        JSON.stringify(serializeCatalog(createEmptyCatalog()), null, 2),
-        "utf8",
-      );
-    }
+    ensureJsonFile(this.filePath, serializeCatalog(createEmptyCatalog()));
   }
 
   load(): Catalog {
@@ -90,5 +99,40 @@ export class CatalogStore {
   save(catalog: Catalog): void {
     this.ensureFile();
     fs.writeFileSync(this.filePath, JSON.stringify(serializeCatalog(catalog), null, 2), "utf8");
+  }
+}
+
+export class ChecklistStore {
+  constructor(private readonly filePath: string) {}
+
+  ensureFile(): void {
+    ensureJsonFile(this.filePath, createEmptyChecklistCollection());
+  }
+
+  loadAll(): SerializedChecklistEntry[] {
+    this.ensureFile();
+    const raw = fs.readFileSync(this.filePath, "utf8");
+    const parsed = JSON.parse(raw) as SerializedChecklistCollection;
+    return parsed.entries ?? [];
+  }
+
+  load(resultKey: ResultChecklistKey): SerializedChecklistEntry | undefined {
+    return this.loadAll().find((entry) => entry.resultKey === resultKey);
+  }
+
+  save(entry: SerializedChecklistEntry): void {
+    const entries = this.loadAll().filter((candidate) => candidate.resultKey !== entry.resultKey);
+    entries.push(entry);
+    this.writeAll(entries);
+  }
+
+  remove(resultKey: ResultChecklistKey): void {
+    const entries = this.loadAll().filter((entry) => entry.resultKey !== resultKey);
+    this.writeAll(entries);
+  }
+
+  private writeAll(entries: SerializedChecklistEntry[]): void {
+    this.ensureFile();
+    fs.writeFileSync(this.filePath, JSON.stringify({ entries }, null, 2), "utf8");
   }
 }
