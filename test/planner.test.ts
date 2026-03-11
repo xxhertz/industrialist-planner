@@ -221,6 +221,64 @@ describe("factory planner", () => {
     expect(rootSummary?.outputsPerSecond.map((output) => output.itemLabel)).toEqual(["steel", "steam"]);
   });
 
+  it("plans consumption-only recipes by machine count", () => {
+    const sinkCatalog: Catalog = {
+      schemaVersion: 1,
+      items: [{ id: "waste", name: "Waste", aliases: [] }],
+      recipes: [
+        {
+          id: "void-waste",
+          name: "Void Waste",
+          machineName: "Trash Burner",
+          durationSec: 1n,
+          inputs: [{ itemId: "waste", amount: 1n }],
+          outputs: [],
+        },
+      ],
+    };
+
+    const result = planFactory(sinkCatalog, {
+      rootRecipeId: "void-waste",
+      targetMode: "machineCount",
+      targetValue: "2",
+      recipeSelections: {},
+    });
+
+    expect(result.rootOutputItemId).toBeUndefined();
+    expect(result.rootOutputItemLabel).toBe("consumption");
+    expect(result.externalSources[0]?.scaledRate.toDecimalString(4)).toBe("2");
+    expect(result.processRows[0]?.kind).toBe("machine");
+    if (result.processRows[0]?.kind === "machine") {
+      expect(result.processRows[0].isConsumption).toBe(true);
+      expect(result.processRows[0].itemLabel).toBe("consumption");
+    }
+  });
+
+  it("rejects output-per-second planning for consumption-only recipes", () => {
+    const sinkCatalog: Catalog = {
+      schemaVersion: 1,
+      items: [{ id: "waste", name: "Waste", aliases: [] }],
+      recipes: [
+        {
+          id: "void-waste",
+          name: "Void Waste",
+          machineName: "Trash Burner",
+          durationSec: 1n,
+          inputs: [{ itemId: "waste", amount: 1n }],
+          outputs: [],
+        },
+      ],
+    };
+
+    expect(() =>
+      planFactory(sinkCatalog, {
+        rootRecipeId: "void-waste",
+        targetMode: "outputPerSecond",
+        targetValue: "1",
+        recipeSelections: {},
+      }),
+    ).toThrowError(PlannerError);
+  });
   it("allows machines with inputs and no outputs in the catalog", () => {
     const sinkCatalog: Catalog = {
       schemaVersion: 1,
@@ -345,6 +403,7 @@ describe("factory planner", () => {
     ).toThrowError(PlannerError);
   });
 });
+
 
 
 

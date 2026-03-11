@@ -31,7 +31,7 @@ export interface Catalog {
 
 export interface PlannerRequest {
   rootRecipeId: RecipeId;
-  rootOutputItemId: ItemId;
+  rootOutputItemId?: ItemId;
   targetMode: "machineCount" | "outputPerSecond";
   targetValue: string;
   recipeSelections: Record<ItemId, RecipeId>;
@@ -76,3 +76,5 @@ export interface SerializedChecklistEntry {
 export interface SerializedChecklistCollection {
   entries: SerializedChecklistEntry[];
 }
+
+

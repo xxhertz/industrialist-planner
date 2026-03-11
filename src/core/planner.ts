@@ -9,6 +9,8 @@ import {
 import { Rational, lcm } from "./rational";
 import { Catalog, ItemId, PlannerRequest, Recipe, RecipeId } from "./types";
 
+const CONSUMPTION_LABEL = "consumption";
+
 export class PlannerError extends Error {}
 
 export class MissingRecipeSelectionError extends PlannerError {
@@ -72,6 +74,7 @@ export interface ProcessMachineRow {
   exactMachineCount: Rational;
   scaledMachineCount: bigint;
   outputPerSecond: Rational;
+  isConsumption: boolean;
   byproducts: Array<{
     itemId: ItemId;
     itemLabel: string;
@@ -91,7 +94,7 @@ export type ProcessRow = ProcessMachineRow | ProcessSourceRow;
 
 export interface PlannerResult {
   rootRecipeId: RecipeId;
-  rootOutputItemId: ItemId;
+  rootOutputItemId?: ItemId;
   rootOutputItemLabel: string;
   scaleFactor: bigint;
   achievedOutputPerSecond: Rational;
@@ -203,7 +206,7 @@ function detectCycles(
 
 function buildProcessRows(
   rootRecipeId: RecipeId,
-  rootOutputItemId: ItemId,
+  rootOutputItemId: ItemId | undefined,
   dependencyGraph: Record<RecipeId, DependencyEdge[]>,
   recipeSummaries: RecipePlanSummary[],
   externalSources: ExternalSourceSummary[],
@@ -214,8 +217,8 @@ function buildProcessRows(
   const visitedRecipes = new Set<string>();
   const visitedSources = new Set<ItemId>();
 
-  const visitRecipe = (recipeId: RecipeId, displayItemId: ItemId) => {
-    const visitKey = `${recipeId}:${displayItemId}`;
+  const visitRecipe = (recipeId: RecipeId, displayItemId?: ItemId) => {
+    const visitKey = `${recipeId}:${displayItemId ?? CONSUMPTION_LABEL}`;
     if (visitedRecipes.has(visitKey)) {
       return;
     }
@@ -226,27 +229,31 @@ function buildProcessRows(
       return;
     }
 
-    const mainOutput =
-      summary.outputsPerSecond.find((output) => output.itemId === displayItemId) ??
-      summary.outputsPerSecond[0];
+    const mainOutput = displayItemId
+      ? summary.outputsPerSecond.find((output) => output.itemId === displayItemId) ??
+        summary.outputsPerSecond[0]
+      : undefined;
 
     processRows.push({
       kind: "machine",
       recipeId: summary.recipeId,
       recipeName: summary.recipeName,
       machineName: summary.machineName,
-      itemId: mainOutput.itemId,
-      itemLabel: mainOutput.itemLabel,
+      itemId: mainOutput?.itemId ?? `consumption:${summary.recipeId}`,
+      itemLabel: mainOutput?.itemLabel ?? CONSUMPTION_LABEL,
       exactMachineCount: summary.exactMachineCount,
       scaledMachineCount: summary.scaledMachineCount,
-      outputPerSecond: mainOutput.rate,
-      byproducts: summary.outputsPerSecond
-        .filter((output) => output.itemId !== mainOutput.itemId)
-        .map((output) => ({
-          itemId: output.itemId,
-          itemLabel: output.itemLabel,
-          rate: output.rate,
-        })),
+      outputPerSecond: mainOutput?.rate ?? Rational.zero(),
+      isConsumption: !mainOutput,
+      byproducts: mainOutput
+        ? summary.outputsPerSecond
+            .filter((output) => output.itemId !== mainOutput.itemId)
+            .map((output) => ({
+              itemId: output.itemId,
+              itemLabel: output.itemLabel,
+              rate: output.rate,
+            }))
+        : [],
     });
 
     for (const edge of dependencyGraph[recipeId] ?? []) {
@@ -289,15 +296,23 @@ export function planFactory(catalog: Catalog, request: PlannerRequest): PlannerR
   if (!rootRecipe) {
     throw new PlannerError(`Unknown root recipe: ${request.rootRecipeId}`);
   }
-  if (!getRecipeOutput(rootRecipe, request.rootOutputItemId)) {
+
+  const rootOutputItemId = request.rootOutputItemId ?? rootRecipe.outputs[0]?.itemId;
+  const isConsumptionPlan = !rootOutputItemId;
+
+  if (!isConsumptionPlan && !getRecipeOutput(rootRecipe, rootOutputItemId)) {
     throw new PlannerError(
-      `Root recipe ${rootRecipe.name} does not produce ${request.rootOutputItemId}.`,
+      `Root recipe ${rootRecipe.name} does not produce ${rootOutputItemId}.`,
     );
   }
 
   const targetValue = Rational.parse(request.targetValue);
   if (targetValue.compare(Rational.zero()) <= 0) {
     throw new PlannerError("Target value must be greater than zero.");
+  }
+
+  if (isConsumptionPlan && request.targetMode !== "machineCount") {
+    throw new PlannerError("Consumption-only recipes can only be planned by machine count.");
   }
 
   const resolvedSelections = { ...request.recipeSelections };
@@ -311,7 +326,7 @@ export function planFactory(catalog: Catalog, request: PlannerRequest): PlannerR
   const rootMachineCount =
     request.targetMode === "machineCount"
       ? targetValue
-      : targetValue.div(getOutputRatePerMachine(rootRecipe, request.rootOutputItemId));
+      : targetValue.div(getOutputRatePerMachine(rootRecipe, rootOutputItemId));
 
   addToMachineMap(recipeMachines, rootRecipe.id, rootMachineCount);
   dependencyGraph.set(rootRecipe.id, new Map<ItemId, DependencyEdge>());
@@ -417,18 +432,22 @@ export function planFactory(catalog: Catalog, request: PlannerRequest): PlannerR
 
   return {
     rootRecipeId: rootRecipe.id,
-    rootOutputItemId: request.rootOutputItemId,
-    rootOutputItemLabel: getCompactItemLabel(catalog, request.rootOutputItemId),
+    rootOutputItemId,
+    rootOutputItemLabel: isConsumptionPlan
+      ? CONSUMPTION_LABEL
+      : getCompactItemLabel(catalog, rootOutputItemId),
     scaleFactor,
-    achievedOutputPerSecond: getOutputRatePerMachine(rootRecipe, request.rootOutputItemId)
-      .mul(rootMachineCount)
-      .mul(scaledFactor),
+    achievedOutputPerSecond: isConsumptionPlan
+      ? Rational.zero()
+      : getOutputRatePerMachine(rootRecipe, rootOutputItemId)
+          .mul(rootMachineCount)
+          .mul(scaledFactor),
     recipeSummaries,
     externalSources: externalSourceSummaries,
     dependencyGraph: serializedGraph,
     processRows: buildProcessRows(
       rootRecipe.id,
-      request.rootOutputItemId,
+      isConsumptionPlan ? undefined : rootOutputItemId,
       serializedGraph,
       recipeSummaries,
       externalSourceSummaries,
@@ -440,6 +459,3 @@ export function planFactory(catalog: Catalog, request: PlannerRequest): PlannerR
 export function formatRate(rate: Rational): string {
   return `${rate.toDecimalString(4)}/s (${rate.toFractionString()}/s)`;
 }
-
-
-

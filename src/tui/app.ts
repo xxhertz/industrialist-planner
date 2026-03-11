@@ -37,7 +37,7 @@ type CatalogTab = "items" | "recipes";
 
 type PlannerChoice = {
   recipeId: string;
-  outputItemId: string;
+  outputItemId?: string;
   label: string;
 };
 
@@ -506,11 +506,18 @@ export class IndustrialistApp {
 
   private getPlannerChoices(): PlannerChoice[] {
     return this.catalog.recipes.flatMap((recipe) =>
-      recipe.outputs.map((output) => ({
-        recipeId: recipe.id,
-        outputItemId: output.itemId,
-        label: `${getCompactItemLabel(this.catalog, output.itemId)} via ${recipe.name}`,
-      })),
+      recipe.outputs.length > 0
+        ? recipe.outputs.map((output) => ({
+            recipeId: recipe.id,
+            outputItemId: output.itemId,
+            label: `${getCompactItemLabel(this.catalog, output.itemId)} via ${recipe.name}`,
+          }))
+        : [
+            {
+              recipeId: recipe.id,
+              label: `${recipe.name} (consumption)`,
+            },
+          ],
     );
   }
 
@@ -526,7 +533,7 @@ export class IndustrialistApp {
       width: "100%-4",
       height: 4,
       content:
-        "Select the output you want to plan around. The wizard will ask for either machine count or target output per second, then resolve alternative upstream recipes if needed.",
+        "Select the recipe or output you want to plan around. Output recipes can be planned by machine count or output per second; consumption-only recipes use machine count.",
     });
 
     const plannerChoices = this.getPlannerChoices();
@@ -569,17 +576,22 @@ export class IndustrialistApp {
     this.screen.render();
   }
 
-  private async runPlannerWizard(rootRecipe: Recipe, rootOutputItemId: string): Promise<void> {
-    const targetModeIndex = await this.promptChoice("Target mode", [
-      "Machine count",
-      "Output per second",
-    ]);
-    if (targetModeIndex === null) {
-      this.showPlannerView();
-      return;
+  private async runPlannerWizard(rootRecipe: Recipe, rootOutputItemId?: string): Promise<void> {
+    const supportsOutputPlanning = typeof rootOutputItemId === "string";
+    let targetMode: PlannerRequest["targetMode"] = "machineCount";
+
+    if (supportsOutputPlanning) {
+      const targetModeIndex = await this.promptChoice("Target mode", [
+        "Machine count",
+        "Output per second",
+      ]);
+      if (targetModeIndex === null) {
+        this.showPlannerView();
+        return;
+      }
+      targetMode = targetModeIndex === 0 ? "machineCount" : "outputPerSecond";
     }
 
-    const targetMode = targetModeIndex === 0 ? "machineCount" : "outputPerSecond";
     const targetValue = await this.promptInput(
       targetMode === "machineCount" ? "Desired machine count" : "Desired output per second",
       "1",
@@ -591,10 +603,10 @@ export class IndustrialistApp {
 
     const request: PlannerRequest = {
       rootRecipeId: rootRecipe.id,
-      rootOutputItemId,
       targetMode,
       targetValue,
       recipeSelections: {},
+      ...(rootOutputItemId ? { rootOutputItemId } : {}),
     };
 
     while (true) {
@@ -649,9 +661,13 @@ export class IndustrialistApp {
       height: 4,
       tags: true,
       content:
-        `{bold}${rootRecipe?.name ?? result.rootRecipeId}{/bold} for {bold}${result.rootOutputItemLabel}{/bold}\n` +
-        `Scale factor: ${result.scaleFactor.toString()}\n` +
-        `Achieved output: ${formatRate(result.achievedOutputPerSecond)}`,
+        (result.rootOutputItemId
+          ? `{bold}${rootRecipe?.name ?? result.rootRecipeId}{/bold} for {bold}${result.rootOutputItemLabel}{/bold}\n` +
+            `Scale factor: ${result.scaleFactor.toString()}\n` +
+            `Achieved output: ${formatRate(result.achievedOutputPerSecond)}`
+          : `{bold}${rootRecipe?.name ?? result.rootRecipeId}{/bold} consumption plan\n` +
+            `Scale factor: ${result.scaleFactor.toString()}\n` +
+            `Steady inputs: see process order and external sources`),
     });
 
     blessed.listtable({
@@ -671,7 +687,7 @@ export class IndustrialistApp {
                 this.formatProcessItem(row),
                 row.exactMachineCount.toFractionString(),
                 row.scaledMachineCount.toString(),
-                row.outputPerSecond.toDecimalString(4),
+                row.isConsumption ? "n/a" : row.outputPerSecond.toDecimalString(4),
               ]
             : [
                 "",
@@ -824,23 +840,26 @@ export class IndustrialistApp {
     const lines: string[] = [];
     const visited = new Set<string>();
 
-    const visit = (recipeId: string, depth: number, displayItemId: string) => {
+    const visit = (recipeId: string, depth: number, displayItemId?: string) => {
       const recipe = getRecipeById(this.catalog, recipeId);
       const summary = result.recipeSummaries.find((entry) => entry.recipeId === recipeId);
       if (!recipe || !summary) {
         return;
       }
 
-      const output =
-        summary.outputsPerSecond.find((entry) => entry.itemId === displayItemId) ??
-        summary.outputsPerSecond[0];
-      const byproducts = summary.outputsPerSecond
-        .filter((entry) => entry.itemId !== output.itemId)
-        .map((entry) => entry.itemLabel);
+      const output = displayItemId
+        ? summary.outputsPerSecond.find((entry) => entry.itemId === displayItemId) ??
+          summary.outputsPerSecond[0]
+        : undefined;
+      const byproducts = output
+        ? summary.outputsPerSecond
+            .filter((entry) => entry.itemId !== output.itemId)
+            .map((entry) => entry.itemLabel)
+        : [];
 
       const indent = "  ".repeat(depth);
       lines.push(
-        `${indent}${recipe.machineName} [${output.itemLabel}${byproducts.length > 0 ? ` + ${byproducts.join(", ")}` : ""}] x${summary.scaledMachineCount.toString()}`,
+        `${indent}${recipe.machineName} [${output?.itemLabel ?? "consumption"}${byproducts.length > 0 ? ` + ${byproducts.join(", ")}` : ""}] x${summary.scaledMachineCount.toString()}`,
       );
 
       for (const edge of result.dependencyGraph[recipeId] ?? []) {
@@ -1071,6 +1090,11 @@ export function createAppWithDefaultStore(): IndustrialistApp {
     new ChecklistStore(path.join(process.cwd(), "data", "checklists.json")),
   );
 }
+
+
+
+
+
 
 
 
