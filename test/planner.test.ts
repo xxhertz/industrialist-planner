@@ -82,6 +82,36 @@ describe("factory planner", () => {
     expect(coal?.itemLabel).toBe("coal");
   });
 
+  it("supports decimal recipe amounts", () => {
+    const decimalCatalog: Catalog = {
+      schemaVersion: 1,
+      items: [
+        { id: "ore", name: "Ore", aliases: [] },
+        { id: "plate", name: "Plate", aliases: [] },
+      ],
+      recipes: [
+        {
+          id: "plate-half-rate",
+          name: "Half Rate Plate",
+          machineName: "Assembler",
+          durationSec: 1n,
+          inputs: [{ itemId: "ore", amount: "1.25" }],
+          outputs: [{ itemId: "plate", amount: "0.5" }],
+        },
+      ],
+    };
+
+    const result = planFactory(decimalCatalog, {
+      rootRecipeId: "plate-half-rate",
+      rootOutputItemId: "plate",
+      targetMode: "machineCount",
+      targetValue: "1",
+      recipeSelections: {},
+    });
+
+    expect(result.achievedOutputPerSecond.toDecimalString(4)).toBe("0.5");
+    expect(result.externalSources[0]?.scaledRate.toDecimalString(4)).toBe("1.25");
+  });
   it("supports output-per-second planning for the selected root output", () => {
     const result = planFactory(steelCatalog, {
       rootRecipeId: "steel",
@@ -285,4 +315,5 @@ describe("factory planner", () => {
     ).toThrowError(PlannerError);
   });
 });
+
 

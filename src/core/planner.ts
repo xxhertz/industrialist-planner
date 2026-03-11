@@ -1,3 +1,4 @@
+import { parseRecipeAmount } from "./amount";
 import {
   getCompactItemLabel,
   getItemById,
@@ -105,12 +106,16 @@ function getRecipeOutput(recipe: Recipe, itemId: ItemId) {
   return recipe.outputs.find((output) => output.itemId === itemId);
 }
 
+function getAmountPerSecond(amount: Recipe["inputs"][number]["amount"], durationSec: bigint): Rational {
+  return parseRecipeAmount(amount).div(Rational.fromBigInt(durationSec));
+}
+
 function getOutputRatePerMachine(recipe: Recipe, outputItemId: ItemId): Rational {
   const output = getRecipeOutput(recipe, outputItemId);
   if (!output) {
     throw new PlannerError(`Recipe ${recipe.name} does not produce ${outputItemId}.`);
   }
-  return new Rational(output.amount, recipe.durationSec);
+  return getAmountPerSecond(output.amount, recipe.durationSec);
 }
 
 function getInputRatePerMachine(recipe: Recipe, itemId: ItemId): Rational {
@@ -118,7 +123,7 @@ function getInputRatePerMachine(recipe: Recipe, itemId: ItemId): Rational {
   if (!ingredient) {
     return Rational.zero();
   }
-  return new Rational(ingredient.amount, recipe.durationSec);
+  return getAmountPerSecond(ingredient.amount, recipe.durationSec);
 }
 
 function addToRateMap(target: Map<ItemId, Rational>, itemId: ItemId, value: Rational): void {
@@ -312,7 +317,7 @@ export function planFactory(catalog: Catalog, request: PlannerRequest): PlannerR
   dependencyGraph.set(rootRecipe.id, new Map<ItemId, DependencyEdge>());
 
   for (const input of rootRecipe.inputs) {
-    const inputDemand = new Rational(input.amount, rootRecipe.durationSec).mul(rootMachineCount);
+    const inputDemand = getAmountPerSecond(input.amount, rootRecipe.durationSec).mul(rootMachineCount);
     addToRateMap(frontier, input.itemId, inputDemand);
     const producer = resolveProducer(catalog, input.itemId, resolvedSelections);
     dependencyGraph.get(rootRecipe.id)?.set(input.itemId, {
@@ -386,13 +391,13 @@ export function planFactory(catalog: Catalog, request: PlannerRequest): PlannerR
         itemId: output.itemId,
         itemName: getItemById(catalog, output.itemId)?.name ?? output.itemId,
         itemLabel: getCompactItemLabel(catalog, output.itemId),
-        rate: new Rational(output.amount, recipe.durationSec).mul(scaledMachineCount),
+        rate: getAmountPerSecond(output.amount, recipe.durationSec).mul(scaledMachineCount),
       })),
       inputsPerSecond: recipe.inputs.map((input) => ({
         itemId: input.itemId,
         itemName: getItemById(catalog, input.itemId)?.name ?? input.itemId,
         itemLabel: getCompactItemLabel(catalog, input.itemId),
-        rate: new Rational(input.amount, recipe.durationSec).mul(scaledMachineCount),
+        rate: getAmountPerSecond(input.amount, recipe.durationSec).mul(scaledMachineCount),
       })),
     };
   });

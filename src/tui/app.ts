@@ -23,7 +23,9 @@ import {
   PlannerResult,
   ProcessMachineRow,
 } from "../core/planner";
+import { formatRecipeAmount } from "../core/amount";
 import { CatalogStore, ChecklistStore } from "../core/storage";
+import { Rational } from "../core/rational";
 import { Catalog, Item, PlannerRequest, Recipe, RecipeIngredient } from "../core/types";
 
 type KeyBinding = {
@@ -361,14 +363,14 @@ export class IndustrialistApp {
             recipe.outputs
               .map(
                 (output) =>
-                  `${getItemById(this.catalog, output.itemId)?.name ?? output.itemId} x${output.amount.toString()}`,
+                  `${getItemById(this.catalog, output.itemId)?.name ?? output.itemId} x${formatRecipeAmount(output.amount)}`,
               )
               .join(", "),
             `${recipe.durationSec.toString()}s`,
             recipe.inputs
               .map(
                 (input) =>
-                  `${getItemById(this.catalog, input.itemId)?.name ?? input.itemId} x${input.amount.toString()}`,
+                  `${getItemById(this.catalog, input.itemId)?.name ?? input.itemId} x${formatRecipeAmount(input.amount)}`,
               )
               .join(", "),
           ]),
@@ -401,6 +403,27 @@ export class IndustrialistApp {
       }
     };
 
+    const getLiveSelectedIndex = () => {
+      const rows = getRowsForCurrentTab();
+      if (rows.length === 0) {
+        return -1;
+      }
+
+      const liveIndex = (table as unknown as { selected?: number }).selected;
+      if (typeof liveIndex !== "number") {
+        return getSelectedIndex();
+      }
+
+      return Math.max(0, Math.min(liveIndex - 1, rows.length - 1));
+    };
+
+    const syncStoredSelectionFromTable = () => {
+      const index = getLiveSelectedIndex();
+      if (index >= 0) {
+        setSelection(index);
+      }
+    };
+
     const syncTableSelection = () => {
       if (getSelectedIndex() >= 0) {
         table.select(getSelectedIndex() + 1);
@@ -414,6 +437,7 @@ export class IndustrialistApp {
     this.bindViewKey(["q"], () => this.showHome());
     this.bindViewKey(["p"], () => this.showPlannerView());
     this.bindViewKey(["a"], async () => {
+      syncStoredSelectionFromTable();
       if (this.currentTab === "items") {
         await this.addItem();
       } else {
@@ -423,13 +447,14 @@ export class IndustrialistApp {
       syncTableSelection();
     });
     this.bindViewKey(["e"], async () => {
+      syncStoredSelectionFromTable();
       if (this.currentTab === "items") {
-        const item = this.catalog.items[getSelectedIndex()];
+        const item = this.catalog.items[getLiveSelectedIndex()];
         if (item) {
           await this.editItem(item);
         }
       } else {
-        const recipe = this.catalog.recipes[getSelectedIndex()];
+        const recipe = this.catalog.recipes[getLiveSelectedIndex()];
         if (recipe) {
           await this.editRecipe(recipe);
         }
@@ -438,13 +463,14 @@ export class IndustrialistApp {
       syncTableSelection();
     });
     this.bindViewKey(["d"], async () => {
+      syncStoredSelectionFromTable();
       if (this.currentTab === "items") {
-        const item = this.catalog.items[getSelectedIndex()];
+        const item = this.catalog.items[getLiveSelectedIndex()];
         if (item) {
           await this.deleteItem(item);
         }
       } else {
-        const recipe = this.catalog.recipes[getSelectedIndex()];
+        const recipe = this.catalog.recipes[getLiveSelectedIndex()];
         if (recipe) {
           await this.deleteRecipe(recipe);
         }
@@ -453,13 +479,14 @@ export class IndustrialistApp {
       syncTableSelection();
     });
     table.key(["enter"], async () => {
+      syncStoredSelectionFromTable();
       if (this.currentTab === "items") {
-        const item = this.catalog.items[getSelectedIndex()];
+        const item = this.catalog.items[getLiveSelectedIndex()];
         if (item) {
           await this.editItem(item);
         }
       } else {
-        const recipe = this.catalog.recipes[getSelectedIndex()];
+        const recipe = this.catalog.recipes[getLiveSelectedIndex()];
         if (recipe) {
           await this.editRecipe(recipe);
         }
@@ -990,7 +1017,7 @@ export class IndustrialistApp {
     return ingredients
       .map(
         (ingredient) =>
-          `${getItemById(this.catalog, ingredient.itemId)?.name ?? ingredient.itemId}:${ingredient.amount.toString()}`,
+          `${getItemById(this.catalog, ingredient.itemId)?.name ?? ingredient.itemId}:${formatRecipeAmount(ingredient.amount)}`,
       )
       .join(", ");
   }
@@ -1009,8 +1036,9 @@ export class IndustrialistApp {
       if (!item) {
         throw new Error(`Unknown item "${itemToken.trim()}".`);
       }
-      const amount = BigInt(amountToken.trim());
-      if (amount <= 0n) {
+      const amount = amountToken.trim();
+      const parsedAmount = Rational.parse(amount);
+      if (parsedAmount.compare(Rational.zero()) <= 0) {
         throw new Error(`${label[0].toUpperCase()}${label.slice(1)} amount for "${item.name}" must be positive.`);
       }
       return {
@@ -1042,6 +1070,10 @@ export function createAppWithDefaultStore(): IndustrialistApp {
     new ChecklistStore(path.join(process.cwd(), "data", "checklists.json")),
   );
 }
+
+
+
+
 
 
 

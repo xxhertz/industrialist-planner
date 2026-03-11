@@ -1,3 +1,4 @@
+import { parseRecipeAmount } from "./amount";
 import { Catalog, Item, ItemId, Recipe, RecipeId } from "./types";
 
 export function createEmptyCatalog(): Catalog {
@@ -62,16 +63,24 @@ export function validateCatalog(catalog: Catalog): string[] {
       errors.push(`Recipe ${recipe.name} must have at least one input or output.`);
     }
     for (const output of recipe.outputs) {
-      if (output.amount <= 0n) {
-        errors.push(`Recipe ${recipe.name} has a non-positive output amount.`);
+      try {
+        if (parseRecipeAmount(output.amount).compare(parseRecipeAmount(0n)) <= 0) {
+          errors.push(`Recipe ${recipe.name} has a non-positive output amount.`);
+        }
+      } catch {
+        errors.push(`Recipe ${recipe.name} has an invalid output amount.`);
       }
       if (!itemIds.has(output.itemId)) {
         errors.push(`Recipe ${recipe.name} output item does not exist.`);
       }
     }
     for (const input of recipe.inputs) {
-      if (input.amount <= 0n) {
-        errors.push(`Recipe ${recipe.name} has a non-positive input amount.`);
+      try {
+        if (parseRecipeAmount(input.amount).compare(parseRecipeAmount(0n)) <= 0) {
+          errors.push(`Recipe ${recipe.name} has a non-positive input amount.`);
+        }
+      } catch {
+        errors.push(`Recipe ${recipe.name} has an invalid input amount.`);
       }
       if (!itemIds.has(input.itemId)) {
         errors.push(`Recipe ${recipe.name} input item does not exist.`);
@@ -121,5 +130,3 @@ export function resolveItemByName(catalog: Catalog, raw: string): Item | undefin
     return item.aliases.some((alias) => alias.trim().toLowerCase() === normalized);
   });
 }
-
-

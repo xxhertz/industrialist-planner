@@ -11,7 +11,7 @@ import {
   SerializedRecipeIngredient,
 } from "./types";
 
-function serializeIngredient(ingredient: { itemId: string; amount: bigint }): SerializedRecipeIngredient {
+function serializeIngredient(ingredient: { itemId: string; amount: string | bigint }): SerializedRecipeIngredient {
   return {
     itemId: ingredient.itemId,
     amount: ingredient.amount.toString(),
@@ -58,11 +58,11 @@ export function deserializeCatalog(serialized: SerializedCatalog): Catalog {
         durationSec: BigInt(recipe.durationSec),
         inputs: recipe.inputs.map((input) => ({
           itemId: input.itemId,
-          amount: BigInt(input.amount),
+          amount: input.amount,
         })),
         outputs: outputs.map((output) => ({
           itemId: output.itemId,
-          amount: BigInt(output.amount),
+          amount: output.amount,
         })),
       };
     }),

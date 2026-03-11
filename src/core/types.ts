@@ -1,5 +1,6 @@
 export type ItemId = string;
 export type RecipeId = string;
+export type RecipeAmount = string | bigint;
 
 export interface Item {
   id: ItemId;
@@ -9,7 +10,7 @@ export interface Item {
 
 export interface RecipeIngredient {
   itemId: ItemId;
-  amount: bigint;
+  amount: RecipeAmount;
 }
 
 export interface Recipe {
@@ -74,4 +75,3 @@ export interface SerializedChecklistEntry {
 export interface SerializedChecklistCollection {
   entries: SerializedChecklistEntry[];
 }
-
