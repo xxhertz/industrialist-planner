@@ -6,6 +6,10 @@ industrialist-planner is a typescript terminal app for defining production items
 
 industrialist tui production planner for building recipe catalogs and calculating full-efficiency machine chains
 
+## screenshot
+
+![screenshot of the program](https://i.imgur.com/Aq9PHS3.png)
+
 ## features
 
 - terminal interface built with blessed
