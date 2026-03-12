@@ -98,6 +98,7 @@ export interface PlannerResult {
   rootOutputItemLabel: string;
   scaleFactor: bigint;
   achievedOutputPerSecond: Rational;
+  itemNetRates: Record<ItemId, Rational>;
   recipeSummaries: RecipePlanSummary[];
   externalSources: ExternalSourceSummary[];
   dependencyGraph: Record<RecipeId, DependencyEdge[]>;
@@ -137,6 +138,145 @@ function addToRateMap(target: Map<ItemId, Rational>, itemId: ItemId, value: Rati
 function addToMachineMap(target: Map<RecipeId, Rational>, recipeId: RecipeId, value: Rational): void {
   const existing = target.get(recipeId) ?? Rational.zero();
   target.set(recipeId, existing.add(value));
+}
+
+function roundRational(value: Rational): bigint {
+  if (value.numerator < 0n) {
+    throw new PlannerError("Cannot round negative machine counts.");
+  }
+  const floor = value.numerator / value.denominator;
+  const remainder = value.numerator % value.denominator;
+  if (remainder * 2n >= value.denominator) {
+    return floor + 1n;
+  }
+  return floor;
+}
+
+function getMaxScaleFactorForCaps(
+  recipeMachines: Map<RecipeId, Rational>,
+  perRecipeCaps: Map<RecipeId, bigint>,
+): bigint {
+  let maxScaleFactor: bigint | null = null;
+  for (const [recipeId, cap] of perRecipeCaps.entries()) {
+    const machineCount = recipeMachines.get(recipeId);
+    if (!machineCount || machineCount.numerator <= 0n) {
+      continue;
+    }
+    const bound = (cap * machineCount.denominator) / machineCount.numerator;
+    if (maxScaleFactor === null || bound < maxScaleFactor) {
+      maxScaleFactor = bound;
+    }
+  }
+  return maxScaleFactor ?? 1n;
+}
+
+function getScaledMachineCounts(
+  recipeMachines: Map<RecipeId, Rational>,
+  perRecipeCaps?: Map<RecipeId, bigint>,
+): {
+  scaleFactor: bigint;
+  scaledMachineCounts: Map<RecipeId, bigint>;
+} {
+  let scaleFactor = 1n;
+  for (const machineCount of recipeMachines.values()) {
+    scaleFactor = lcm(scaleFactor, machineCount.denominator);
+  }
+
+  const scaledMachineCounts = new Map<RecipeId, bigint>();
+  if (!perRecipeCaps || perRecipeCaps.size === 0) {
+    const scaledFactor = Rational.fromBigInt(scaleFactor);
+    for (const [recipeId, exactMachineCount] of recipeMachines.entries()) {
+      const scaledMachineCount = exactMachineCount.mul(scaledFactor);
+      scaledMachineCounts.set(recipeId, scaledMachineCount.numerator);
+    }
+    return { scaleFactor, scaledMachineCounts };
+  }
+
+  let maxScaleFactor = getMaxScaleFactorForCaps(recipeMachines, perRecipeCaps);
+  if (scaleFactor <= maxScaleFactor) {
+    const scaledFactor = Rational.fromBigInt(scaleFactor);
+    for (const [recipeId, exactMachineCount] of recipeMachines.entries()) {
+      const scaledMachineCount = exactMachineCount.mul(scaledFactor);
+      scaledMachineCounts.set(recipeId, scaledMachineCount.numerator);
+    }
+    return { scaleFactor, scaledMachineCounts };
+  }
+
+  scaleFactor = maxScaleFactor > 0n ? maxScaleFactor : 1n;
+  const scaledFactor = Rational.fromBigInt(scaleFactor);
+  for (const [recipeId, exactMachineCount] of recipeMachines.entries()) {
+    const scaledExact = exactMachineCount.mul(scaledFactor);
+    let rounded = roundRational(scaledExact);
+    if (rounded < 1n) {
+      rounded = 1n;
+    }
+    const recipeCap = perRecipeCaps?.get(recipeId);
+    if (recipeCap !== undefined && rounded > recipeCap) {
+      rounded = recipeCap;
+    }
+    scaledMachineCounts.set(recipeId, rounded);
+  }
+
+  return { scaleFactor, scaledMachineCounts };
+}
+
+function buildScaledExternalSources(
+  catalog: Catalog,
+  recipeSummaries: RecipePlanSummary[],
+  dependencyGraph: Record<RecipeId, DependencyEdge[]>,
+): ExternalSourceSummary[] {
+  const scaledMap = new Map<ItemId, Rational>();
+  const summaryByRecipeId = new Map(
+    recipeSummaries.map((summary) => [summary.recipeId, summary]),
+  );
+
+  for (const [recipeId, edges] of Object.entries(dependencyGraph)) {
+    const summary = summaryByRecipeId.get(recipeId);
+    if (!summary) {
+      continue;
+    }
+    for (const edge of edges) {
+      if (edge.producerRecipeId) {
+        continue;
+      }
+      const rate =
+        summary.inputsPerSecond.find((input) => input.itemId === edge.itemId)?.rate ??
+        Rational.zero();
+      addToRateMap(scaledMap, edge.itemId, rate);
+    }
+  }
+
+  return [...scaledMap.entries()].map(([itemId, scaledRate]) => ({
+    itemId,
+    itemName: getItemById(catalog, itemId)?.name ?? itemId,
+    itemLabel: getCompactItemLabel(catalog, itemId),
+    exactRate: Rational.zero(),
+    scaledRate,
+  }));
+}
+
+function buildItemNetRates(recipeSummaries: RecipePlanSummary[]): Record<ItemId, Rational> {
+  const produced = new Map<ItemId, Rational>();
+  const consumed = new Map<ItemId, Rational>();
+
+  for (const summary of recipeSummaries) {
+    for (const output of summary.outputsPerSecond) {
+      addToRateMap(produced, output.itemId, output.rate);
+    }
+    for (const input of summary.inputsPerSecond) {
+      addToRateMap(consumed, input.itemId, input.rate);
+    }
+  }
+
+  const netRates: Record<ItemId, Rational> = {};
+  const itemIds = new Set<ItemId>([...produced.keys(), ...consumed.keys()]);
+  for (const itemId of itemIds) {
+    const producedRate = produced.get(itemId) ?? Rational.zero();
+    const consumedRate = consumed.get(itemId) ?? Rational.zero();
+    netRates[itemId] = producedRate.sub(consumedRate);
+  }
+
+  return netRates;
 }
 
 function resolveProducer(
@@ -315,6 +455,24 @@ export function planFactory(catalog: Catalog, request: PlannerRequest): PlannerR
     throw new PlannerError("Consumption-only recipes can only be planned by machine count.");
   }
 
+  const perRecipeCaps = request.perRecipeCaps
+    ? (() => {
+        const caps = new Map<RecipeId, bigint>();
+        for (const [recipeId, rawValue] of Object.entries(request.perRecipeCaps)) {
+          const trimmed = rawValue.trim();
+          if (!trimmed) {
+            continue;
+          }
+          const parsed = Rational.parse(trimmed);
+          if (parsed.compare(Rational.zero()) <= 0 || parsed.denominator !== 1n) {
+            throw new PlannerError("Per-recipe caps must be positive whole numbers.");
+          }
+          caps.set(recipeId, parsed.numerator);
+        }
+        return caps;
+      })()
+    : undefined;
+
   const resolvedSelections = { ...request.recipeSelections };
   detectCycles(catalog, rootRecipe.id, resolvedSelections);
 
@@ -383,52 +541,74 @@ export function planFactory(catalog: Catalog, request: PlannerRequest): PlannerR
     }
   }
 
-  let scaleFactor = 1n;
-  for (const machineCount of recipeMachines.values()) {
-    scaleFactor = lcm(scaleFactor, machineCount.denominator);
+  if (perRecipeCaps) {
+    for (const recipeId of perRecipeCaps.keys()) {
+      if (!recipeMachines.has(recipeId)) {
+        throw new PlannerError(`Cap recipe ${recipeId} is not part of this plan.`);
+      }
+    }
   }
 
-  const scaledFactor = Rational.fromBigInt(scaleFactor);
+  const { scaleFactor, scaledMachineCounts } = getScaledMachineCounts(
+    recipeMachines,
+    perRecipeCaps,
+  );
+
   const recipeSummaries = [...recipeMachines.entries()].map(([recipeId, exactMachineCount]) => {
     const recipe = getRecipeById(catalog, recipeId);
     if (!recipe) {
       throw new PlannerError(`Unknown recipe id in result: ${recipeId}`);
     }
 
-    const scaledMachineCount = exactMachineCount.mul(scaledFactor);
+    const scaledMachineCount = scaledMachineCounts.get(recipeId) ?? 0n;
     return {
       recipeId,
       recipeName: recipe.name,
       machineName: recipe.machineName,
       exactMachineCount,
-      scaledMachineCount: scaledMachineCount.numerator,
+      scaledMachineCount,
       outputsPerSecond: recipe.outputs.map((output) => ({
         itemId: output.itemId,
         itemName: getItemById(catalog, output.itemId)?.name ?? output.itemId,
         itemLabel: getCompactItemLabel(catalog, output.itemId),
-        rate: getAmountPerSecond(output.amount, recipe.durationSec).mul(scaledMachineCount),
+        rate: getAmountPerSecond(output.amount, recipe.durationSec).mul(
+          Rational.fromBigInt(scaledMachineCount),
+        ),
       })),
       inputsPerSecond: recipe.inputs.map((input) => ({
         itemId: input.itemId,
         itemName: getItemById(catalog, input.itemId)?.name ?? input.itemId,
         itemLabel: getCompactItemLabel(catalog, input.itemId),
-        rate: getAmountPerSecond(input.amount, recipe.durationSec).mul(scaledMachineCount),
+        rate: getAmountPerSecond(input.amount, recipe.durationSec).mul(
+          Rational.fromBigInt(scaledMachineCount),
+        ),
       })),
     };
   });
-
-  const externalSourceSummaries = [...externalSources.entries()].map(([itemId, exactRate]) => ({
-    itemId,
-    itemName: getItemById(catalog, itemId)?.name ?? itemId,
-    itemLabel: getCompactItemLabel(catalog, itemId),
-    exactRate,
-    scaledRate: exactRate.mul(scaledFactor),
-  }));
 
   const serializedGraph: Record<RecipeId, DependencyEdge[]> = {};
   for (const [recipeId, edges] of dependencyGraph.entries()) {
     serializedGraph[recipeId] = [...edges.values()];
   }
+
+  const scaledExternalSources = buildScaledExternalSources(
+    catalog,
+    recipeSummaries,
+    serializedGraph,
+  );
+  const scaledExternalMap = new Map(
+    scaledExternalSources.map((source) => [source.itemId, source.scaledRate]),
+  );
+  const externalSourceSummaries = [...externalSources.entries()].map(([itemId, exactRate]) => ({
+    itemId,
+    itemName: getItemById(catalog, itemId)?.name ?? itemId,
+    itemLabel: getCompactItemLabel(catalog, itemId),
+    exactRate,
+    scaledRate: scaledExternalMap.get(itemId) ?? Rational.zero(),
+  }));
+
+  const rootScaledMachineCount = scaledMachineCounts.get(rootRecipe.id) ?? 0n;
+  const itemNetRates = buildItemNetRates(recipeSummaries);
 
   return {
     rootRecipeId: rootRecipe.id,
@@ -440,8 +620,8 @@ export function planFactory(catalog: Catalog, request: PlannerRequest): PlannerR
     achievedOutputPerSecond: isConsumptionPlan
       ? Rational.zero()
       : getOutputRatePerMachine(rootRecipe, rootOutputItemId)
-          .mul(rootMachineCount)
-          .mul(scaledFactor),
+          .mul(Rational.fromBigInt(rootScaledMachineCount)),
+    itemNetRates,
     recipeSummaries,
     externalSources: externalSourceSummaries,
     dependencyGraph: serializedGraph,

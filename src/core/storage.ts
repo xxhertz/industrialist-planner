@@ -36,6 +36,7 @@ export function serializeCatalog(catalog: Catalog): SerializedCatalog {
       id: item.id,
       name: item.name,
       aliases: [...item.aliases],
+      showInPlanner: item.showInPlanner,
     })),
     recipes: catalog.recipes.map(serializeRecipe),
   };
@@ -48,6 +49,7 @@ export function deserializeCatalog(serialized: SerializedCatalog): Catalog {
       id: item.id,
       name: item.name,
       aliases: [...item.aliases],
+      showInPlanner: item.showInPlanner ?? true,
     })),
     recipes: serialized.recipes.map((recipe) => {
       const outputs = recipe.outputs ?? (recipe.output ? [recipe.output] : []);

@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   buildChecklistEntry,
   buildChecklistItems,
+  createChecklistItemId,
   createChecklistResultKey,
 } from "../core/checklist";
 import {
@@ -39,6 +40,9 @@ type PlannerChoice = {
   recipeId: string;
   outputItemId?: string;
   label: string;
+  recipeName: string;
+  itemName?: string;
+  index: number;
 };
 
 export class IndustrialistApp {
@@ -79,9 +83,17 @@ export class IndustrialistApp {
   });
 
   private readonly bindings: KeyBinding[] = [];
+  private readonly keypressBindings: Array<
+    (ch: string, key: Widgets.Events.IKeyEventArg) => void
+  > = [];
+  private readonly resizeBindings: Array<() => void> = [];
+  private readonly consumeNextKeys = new Set<string>();
+  private bindingToken = 0;
+  private activeView: "home" | "catalog" | "planner" | "results" = "home";
   private catalog: Catalog = createEmptyCatalog();
   private currentTab: CatalogTab = "items";
   private lastResult: PlannerResult | null = null;
+  private lastPlannerRequest: PlannerRequest | null = null;
   private catalogSelection = {
     items: 0,
     recipes: 0,
@@ -102,6 +114,7 @@ export class IndustrialistApp {
   }
 
   private clearViewBindings(): void {
+    this.bindingToken += 1;
     while (this.bindings.length > 0) {
       const binding = this.bindings.pop();
       if (binding) {
@@ -110,14 +123,125 @@ export class IndustrialistApp {
         }
       }
     }
+    while (this.keypressBindings.length > 0) {
+      const listener = this.keypressBindings.pop();
+      if (listener) {
+        this.screen.off("keypress", listener);
+      }
+    }
+    while (this.resizeBindings.length > 0) {
+      const listener = this.resizeBindings.pop();
+      if (listener) {
+        this.screen.off("resize", listener);
+      }
+    }
   }
 
   private bindViewKey(keys: string[], handler: () => void | Promise<void>): void {
-    const listener = () => {
-      void handler();
+    const token = this.bindingToken;
+    for (const key of keys) {
+      const listener = () => {
+        if (this.bindingToken !== token) {
+          return;
+        }
+        if (this.consumeNextKeys.has(key)) {
+          this.consumeNextKeys.delete(key);
+          return;
+        }
+        void handler();
+      };
+      this.bindings.push({ keys: [key], listener });
+      this.screen.key([key], listener);
+    }
+  }
+
+  private bindViewKeypress(
+    handler: (ch: string, key: Widgets.Events.IKeyEventArg) => void | Promise<void>,
+  ): void {
+    const token = this.bindingToken;
+    const listener = (ch: string, key: Widgets.Events.IKeyEventArg) => {
+      if (this.bindingToken !== token) {
+        return;
+      }
+      void handler(ch, key);
     };
-    this.bindings.push({ keys, listener });
-    this.screen.key(keys, listener);
+    this.keypressBindings.push(listener);
+    this.screen.on("keypress", listener);
+  }
+
+  private bindViewResize(handler: () => void): void {
+    const token = this.bindingToken;
+    const listener = () => {
+      if (this.bindingToken !== token) {
+        return;
+      }
+      handler();
+    };
+    this.resizeBindings.push(listener);
+    this.screen.on("resize", listener);
+  }
+
+  private bindWrapNavigation(
+    list: Widgets.ListElement | Widgets.ListTableElement,
+    headerOffset = 0,
+    onMove?: () => void,
+  ): void {
+    (list as unknown as { keys?: boolean; vi?: boolean }).keys = false;
+    (list as unknown as { keys?: boolean; vi?: boolean }).vi = false;
+
+    const getItemsLength = () =>
+      ((list as unknown as { items?: Widgets.BlessedElement[] }).items ?? []).length;
+
+    const moveSelection = (direction: "up" | "down") => {
+      const total = getItemsLength();
+      if (total <= headerOffset) {
+        return;
+      }
+      const selectedRaw = (list as unknown as { selected?: number }).selected ?? headerOffset;
+      const index = Math.max(selectedRaw - headerOffset, 0);
+      const count = Math.max(total - headerOffset, 0);
+      const nextIndex =
+        direction === "up"
+          ? index <= 0
+            ? count - 1
+            : index - 1
+          : index >= count - 1
+            ? 0
+            : index + 1;
+      list.select(nextIndex + headerOffset);
+      this.screen.render();
+    };
+
+    this.bindViewKey(["up", "k"], () => {
+      onMove?.();
+      moveSelection("up");
+    });
+    this.bindViewKey(["down", "j"], () => {
+      onMove?.();
+      moveSelection("down");
+    });
+  }
+
+  private suspendBindings(): () => void {
+    const active = [...this.bindings];
+    const token = this.bindingToken;
+    for (const binding of active) {
+      for (const key of binding.keys) {
+        this.screen.unkey(key, binding.listener);
+      }
+    }
+    return () => {
+      if (this.bindingToken !== token) {
+        return;
+      }
+      for (const binding of active) {
+        this.screen.key(binding.keys, binding.listener);
+      }
+    };
+  }
+
+  private setActiveView(view: "home" | "catalog" | "planner" | "results"): void {
+    this.activeView = view;
   }
 
   private setChrome(title: string, help: string): void {
@@ -127,10 +251,16 @@ export class IndustrialistApp {
 
   private clearBody(): void {
     this.body.children.slice().forEach((child: Widgets.Node) => child.destroy());
+    this.screen.children
+      .filter((child: Widgets.Node) => child !== this.header && child !== this.body && child !== this.footer)
+      .forEach((child: Widgets.Node) => child.destroy());
   }
 
   private async promptInput(label: string, initial = ""): Promise<string | null> {
     return new Promise((resolve) => {
+      const restoreBindings = this.suspendBindings();
+      let finished = false;
+      const onEnter = () => finish(null, initial);
       const prompt = blessed.prompt({
         parent: this.screen,
         border: "line",
@@ -140,17 +270,26 @@ export class IndustrialistApp {
         left: "center",
         label: ` ${label} `,
       });
-      prompt.input(label, initial, (_error: unknown, value: string | null) => {
+      const finish = (_error: unknown, value: string | null) => {
+        if (finished) {
+          return;
+        }
+        finished = true;
+        this.screen.unkey("enter", onEnter);
         prompt.destroy();
+        restoreBindings();
         this.screen.render();
         resolve(value === null ? null : value.trim());
-      });
+      };
+      prompt.input(label, initial, finish);
+      this.screen.key("enter", onEnter);
       this.screen.render();
     });
   }
 
   private async promptChoice(title: string, items: string[]): Promise<number | null> {
     return new Promise((resolve) => {
+      const restoreBindings = this.suspendBindings();
       const wrapper = blessed.box({
         parent: this.screen,
         border: "line",
@@ -180,19 +319,99 @@ export class IndustrialistApp {
 
       const finish = (value: number | null) => {
         wrapper.destroy();
-        this.screen.render();
-        resolve(value);
+        this.screen.unkey("escape", onEscape);
+        this.consumeNextKeys.add("enter");
+        setTimeout(() => {
+          restoreBindings();
+          this.screen.render();
+          resolve(value);
+        }, 0);
       };
 
       list.on("select", (_item: Widgets.BlessedElement, index: number) => finish(index));
+      list.key(["enter"], () => {
+        const index = (list as unknown as { selected?: number }).selected ?? 0;
+        finish(index);
+      });
       list.key(["escape", "q"], () => finish(null));
+      const onEscape = () => finish(null);
+      this.screen.key("escape", onEscape);
       list.focus();
       this.screen.render();
     });
   }
 
+  private async promptMultiSelect(
+    title: string,
+    items: string[],
+    initialSelected: boolean[],
+  ): Promise<boolean[] | null> {
+    return new Promise((resolve) => {
+      const restoreBindings = this.suspendBindings();
+      const wrapper = blessed.box({
+        parent: this.screen,
+        border: "line",
+        width: "70%",
+        height: Math.min(items.length + 4, 20),
+        top: "center",
+        left: "center",
+        label: ` ${title} `,
+      });
+
+      const list = blessed.list({
+        parent: wrapper,
+        top: 0,
+        left: 0,
+        width: "100%-2",
+        height: "100%-2",
+        keys: true,
+        vi: true,
+        mouse: true,
+        items: [],
+        style: {
+          selected: {
+            bg: "blue",
+          },
+        },
+      });
+
+      const selected = items.map((_, index) => initialSelected[index] ?? false);
+
+      const render = () => {
+        list.setItems(
+          items.map((item, index) => `${selected[index] ? "[x]" : "[ ]"} ${item}`),
+        );
+        const currentIndex = (list as unknown as { selected?: number }).selected ?? 0;
+        list.select(Math.max(0, Math.min(currentIndex, items.length - 1)));
+        this.screen.render();
+      };
+
+      const finish = (value: boolean[] | null) => {
+        wrapper.destroy();
+        restoreBindings();
+        this.screen.render();
+        resolve(value);
+      };
+
+      list.key(["space"], () => {
+        const index = (list as unknown as { selected?: number }).selected ?? 0;
+        if (index >= 0 && index < selected.length) {
+          selected[index] = !selected[index];
+          render();
+        }
+      });
+
+      list.key(["enter"], () => finish([...selected]));
+      list.key(["escape", "q"], () => finish(null));
+
+      list.focus();
+      render();
+    });
+  }
+
   private async confirm(message: string): Promise<boolean> {
     return new Promise((resolve) => {
+      const restoreBindings = this.suspendBindings();
       const question = blessed.question({
         parent: this.screen,
         border: "line",
@@ -204,6 +423,7 @@ export class IndustrialistApp {
       });
       question.ask(message, (answer: boolean) => {
         question.destroy();
+        restoreBindings();
         this.screen.render();
         resolve(answer);
       });
@@ -232,18 +452,21 @@ export class IndustrialistApp {
   }
 
   private showHome(): void {
+    this.setActiveView("home");
     this.clearViewBindings();
     this.clearBody();
     this.setChrome(
       "Industrialist Planner",
       "Enter select  q quit  c catalog  p planner  r results",
     );
+    this.consumeNextKeys.delete("enter");
+    this.consumeNextKeys.delete("space");
 
     blessed.box({
       parent: this.body,
       top: 1,
-      left: 2,
-      width: "100%-4",
+      left: 1,
+      width: "100%-3",
       height: 5,
       tags: true,
       content:
@@ -253,12 +476,12 @@ export class IndustrialistApp {
     const menu = blessed.list({
       parent: this.body,
       top: 7,
-      left: 2,
+      left: 1,
       width: "60%",
       height: 8,
       border: "line",
-      keys: true,
-      vi: true,
+      keys: false,
+      vi: false,
       mouse: true,
       items: ["Catalog", "Planner", "Results", "Quit"],
       style: {
@@ -268,7 +491,7 @@ export class IndustrialistApp {
       },
     });
 
-    menu.on("select", (_item: Widgets.BlessedElement, index: number) => {
+    const handleMenuSelect = (index: number) => {
       if (index === 0) {
         this.showCatalog();
       } else if (index === 1) {
@@ -283,9 +506,17 @@ export class IndustrialistApp {
         this.screen.destroy();
         process.exit(0);
       }
+    };
+
+    menu.on("select", (_item: Widgets.BlessedElement, index: number) => {
+      handleMenuSelect(index);
     });
 
     this.bindViewKey(["q"], () => {
+      if (this.activeView !== "home") {
+        this.showHome();
+        return;
+      }
       this.screen.destroy();
       process.exit(0);
     });
@@ -298,25 +529,41 @@ export class IndustrialistApp {
         await this.showMessage("No Results", "Run a planner calculation first.");
       }
     });
+    this.bindViewKey(["enter"], () => {
+      const selected = (menu as unknown as { selected?: number }).selected ?? 0;
+      handleMenuSelect(selected);
+    });
 
+    this.bindWrapNavigation(menu as unknown as Widgets.ListElement);
     menu.focus();
     this.screen.render();
   }
 
   private showCatalog(): void {
+    this.setActiveView("catalog");
     this.clearViewBindings();
     this.clearBody();
+    if (this.currentTab === "items") {
+      this.catalogSelection.items = 0;
+    } else {
+      this.catalogSelection.recipes = 0;
+    }
+    this.consumeNextKeys.delete("enter");
+    this.consumeNextKeys.delete("space");
     this.setChrome(
       `Catalog: ${this.currentTab}`,
-      "Tab switch  a add  e edit  d delete  p planner  q home",
+      "Tab switch  a add  e edit  d delete  v toggle  p planner  q home",
     );
 
     const errors = validateCatalog(this.catalog);
+    const contentLeft = 1;
+    const contentTop = 1;
+    const contentWidth = "100%-4";
     blessed.box({
       parent: this.body,
-      top: 0,
-      left: 0,
-      width: "100%",
+      top: contentTop,
+      left: contentLeft,
+      width: contentWidth,
       height: 3,
       tags: true,
       content:
@@ -327,13 +574,13 @@ export class IndustrialistApp {
 
     const table = blessed.listtable({
       parent: this.body,
-      top: 3,
-      left: 0,
-      width: "100%",
-      height: "100%-3",
+      top: contentTop + 3,
+      left: contentLeft,
+      width: contentWidth,
+      height: "100%-6",
       border: "line",
-      keys: true,
-      vi: true,
+      keys: false,
+      vi: false,
       mouse: true,
       style: {
         header: {
@@ -350,9 +597,27 @@ export class IndustrialistApp {
 
     const render = () => {
       if (this.currentTab === "items") {
+        const recipesUsingItem = (itemId: string) =>
+          this.catalog.recipes
+            .filter((recipe) => recipe.inputs.some((input) => input.itemId === itemId))
+            .map((recipe) => recipe.name);
+        const machinesProducingItem = (itemId: string) =>
+          [
+            ...new Set(
+              this.catalog.recipes
+                .filter((recipe) => recipe.outputs.some((output) => output.itemId === itemId))
+                .map((recipe) => recipe.machineName),
+            ),
+          ];
         table.setData([
-          ["Name", "Aliases", "Id"],
-          ...this.catalog.items.map((item) => [item.name, item.aliases.join(", "), item.id]),
+          ["Name", "Aliases", "Produced Via", "Machines Producing", "Show in Planner"],
+          ...this.catalog.items.map((item) => [
+            item.name,
+            item.aliases.join(", "),
+            recipesUsingItem(item.id).join(", "),
+            machinesProducingItem(item.id).join(", "),
+            item.showInPlanner ? "shown" : "hidden",
+          ]),
         ]);
       } else {
         table.setData([
@@ -430,6 +695,17 @@ export class IndustrialistApp {
       }
     };
 
+    const applySelection = (index: number) => {
+      const rows = getRowsForCurrentTab();
+      if (rows.length === 0) {
+        return;
+      }
+      const nextIndex = Math.max(0, Math.min(index, rows.length - 1));
+      setSelection(nextIndex);
+      table.select(nextIndex + 1);
+      this.screen.render();
+    };
+
     this.bindViewKey(["tab"], () => {
       this.currentTab = this.currentTab === "items" ? "recipes" : "items";
       this.showCatalog();
@@ -437,6 +713,7 @@ export class IndustrialistApp {
     this.bindViewKey(["q"], () => this.showHome());
     this.bindViewKey(["p"], () => this.showPlannerView());
     this.bindViewKey(["a"], async () => {
+      const desiredIndex = getLiveSelectedIndex();
       syncStoredSelectionFromTable();
       if (this.currentTab === "items") {
         await this.addItem();
@@ -444,9 +721,10 @@ export class IndustrialistApp {
         await this.addRecipe();
       }
       render();
-      syncTableSelection();
+      applySelection(desiredIndex);
     });
     this.bindViewKey(["e"], async () => {
+      const desiredIndex = getLiveSelectedIndex();
       syncStoredSelectionFromTable();
       if (this.currentTab === "items") {
         const item = this.catalog.items[getLiveSelectedIndex()];
@@ -460,103 +738,354 @@ export class IndustrialistApp {
         }
       }
       render();
-      syncTableSelection();
+      applySelection(desiredIndex);
+    });
+    this.bindViewKey(["enter"], async () => {
+      const desiredIndex = getLiveSelectedIndex();
+      syncStoredSelectionFromTable();
+      if (this.currentTab === "items") {
+        const item = this.catalog.items[getLiveSelectedIndex()];
+        if (item) {
+          await this.editItem(item);
+        }
+      } else {
+        const recipe = this.catalog.recipes[getLiveSelectedIndex()];
+        if (recipe) {
+          await this.editRecipe(recipe);
+        }
+      }
+      render();
+      applySelection(desiredIndex);
     });
     this.bindViewKey(["d"], async () => {
+      const desiredIndex = getLiveSelectedIndex();
       syncStoredSelectionFromTable();
       if (this.currentTab === "items") {
         const item = this.catalog.items[getLiveSelectedIndex()];
         if (item) {
-          await this.deleteItem(item);
+          const deleted = await this.deleteItem(item);
+          if (deleted) {
+            return;
+          }
         }
       } else {
         const recipe = this.catalog.recipes[getLiveSelectedIndex()];
         if (recipe) {
-          await this.deleteRecipe(recipe);
+          const deleted = await this.deleteRecipe(recipe);
+          if (deleted) {
+            return;
+          }
         }
       }
       render();
-      syncTableSelection();
+      applySelection(desiredIndex);
     });
-    table.key(["enter"], async () => {
+    this.bindViewKey(["v"], () => {
+      if (this.currentTab !== "items") {
+        return;
+      }
       syncStoredSelectionFromTable();
-      if (this.currentTab === "items") {
-        const item = this.catalog.items[getLiveSelectedIndex()];
-        if (item) {
-          await this.editItem(item);
-        }
-      } else {
-        const recipe = this.catalog.recipes[getLiveSelectedIndex()];
-        if (recipe) {
-          await this.editRecipe(recipe);
-        }
+      const item = this.catalog.items[getLiveSelectedIndex()];
+      if (!item) {
+        return;
       }
+      const selectedIndex = getLiveSelectedIndex();
+      item.showInPlanner = !item.showInPlanner;
+      this.persistCatalog();
       render();
-      syncTableSelection();
+      if (selectedIndex >= 0) {
+        table.select(selectedIndex + 1);
+      }
+      this.screen.render();
     });
-
     table.on("select", (_item: Widgets.BlessedElement, index: number) => {
       setSelection(index - 1);
     });
 
     render();
     syncTableSelection();
+    this.bindWrapNavigation(table as unknown as Widgets.ListTableElement, 1);
     table.focus();
   }
 
   private getPlannerChoices(): PlannerChoice[] {
+    let index = 0;
     return this.catalog.recipes.flatMap((recipe) =>
       recipe.outputs.length > 0
-        ? recipe.outputs.map((output) => ({
-            recipeId: recipe.id,
-            outputItemId: output.itemId,
-            label: `${getCompactItemLabel(this.catalog, output.itemId)} via ${recipe.name}`,
-          }))
+        ? recipe.outputs
+            .filter((output) => {
+              const item = getItemById(this.catalog, output.itemId);
+              return item?.showInPlanner ?? true;
+            })
+            .map((output) => {
+            const item = getItemById(this.catalog, output.itemId);
+            const itemName = item?.name ?? output.itemId;
+            const entry: PlannerChoice = {
+              recipeId: recipe.id,
+              outputItemId: output.itemId,
+              label: `${itemName} via ${recipe.name}`,
+              recipeName: recipe.name,
+              itemName,
+              index,
+            };
+            index += 1;
+            return entry;
+          })
         : [
             {
               recipeId: recipe.id,
               label: `${recipe.name} (consumption)`,
+              recipeName: recipe.name,
+              itemName: undefined,
+              index: index++,
             },
           ],
     );
   }
 
   private showPlannerView(): void {
+    this.setActiveView("planner");
     this.clearViewBindings();
     this.clearBody();
-    this.setChrome("Planner Setup", "Enter or p run plan  q home");
+    this.setChrome("Planner Setup", "Enter run  Esc home  Type to search");
 
     blessed.box({
       parent: this.body,
       top: 1,
-      left: 2,
-      width: "100%-4",
+      left: 1,
+      width: "100%-3",
       height: 4,
       content:
-        "Select the recipe or output you want to plan around. Output recipes can be planned by machine count or output per second; consumption-only recipes use machine count.",
+        "Select the recipe or output you want to plan around. Default target is 1 machine; tweak target mode/value from Results (t).",
+    });
+
+    let searchQuery = "";
+    const choiceKey = (choice: PlannerChoice) =>
+      `${choice.recipeId}:${choice.outputItemId ?? "consumption"}`;
+    let hasActiveSearch = false;
+    let baseSelectionKey: string | null = null;
+    let userMovedSelection = false;
+    let isAutoSelecting = false;
+    let displayIndexToChoiceIndex: Array<number | null> = [];
+    let choiceIndexToDisplayIndex: number[] = [];
+    const searchBox = blessed.box({
+      parent: this.body,
+      top: 5,
+      left: 1,
+      width: "100%-4",
+      height: 3,
+      border: "line",
+      label: " Search ",
+      tags: true,
+      content: " Search: ",
     });
 
     const plannerChoices = this.getPlannerChoices();
+    let filteredChoices = plannerChoices;
     const list = blessed.list({
       parent: this.body,
-      top: 6,
-      left: 2,
-      width: "80%",
-      height: "100%-8",
+      top: 8,
+      left: 1,
+      width: "100%-4",
+      height: "100%-10",
       border: "line",
-      keys: true,
-      vi: true,
+      keys: false,
+      vi: false,
       mouse: true,
-      items: plannerChoices.map((choice) => choice.label),
+      tags: true,
+      items: filteredChoices.map((choice) => choice.label),
       style: {
+        item: {
+          fg: "white",
+        },
         selected: {
           bg: "blue",
         },
       },
     });
 
+    const renderSearch = (matchCount: number, totalCount: number) => {
+      const summary =
+        searchQuery.trim().length === 0 ? "" : ` (${matchCount}/${totalCount})`;
+      searchBox.setContent(` Search: ${searchQuery}${summary}`);
+    };
+
+    const applyFilter = () => {
+      const selectedDisplayIndex = (list as unknown as { selected?: number }).selected ?? 0;
+      const resolveChoiceIndex = (displayIndex: number) => {
+        if (displayIndexToChoiceIndex[displayIndex] !== null) {
+          return displayIndexToChoiceIndex[displayIndex] ?? null;
+        }
+        for (let offset = 1; offset < displayIndexToChoiceIndex.length; offset += 1) {
+          const prevIndex = displayIndex - offset;
+          if (prevIndex >= 0) {
+            const prevChoice = displayIndexToChoiceIndex[prevIndex];
+            if (prevChoice !== null && prevChoice !== undefined) {
+              return prevChoice;
+            }
+          }
+          const nextIndex = displayIndex + offset;
+          if (nextIndex < displayIndexToChoiceIndex.length) {
+            const nextChoice = displayIndexToChoiceIndex[nextIndex];
+            if (nextChoice !== null && nextChoice !== undefined) {
+              return nextChoice;
+            }
+          }
+        }
+        return null;
+      };
+      const selectedChoiceIndex = resolveChoiceIndex(selectedDisplayIndex);
+      const previousSelection =
+        selectedChoiceIndex !== null && selectedChoiceIndex !== undefined
+          ? filteredChoices[selectedChoiceIndex]
+          : undefined;
+      const trimmed = searchQuery.trim().toLowerCase();
+
+      if (!hasActiveSearch && trimmed.length > 0) {
+        hasActiveSearch = true;
+        userMovedSelection = false;
+        baseSelectionKey = previousSelection ? choiceKey(previousSelection) : null;
+      } else if (hasActiveSearch && trimmed.length === 0) {
+        hasActiveSearch = false;
+      }
+
+      const scored = plannerChoices.map((choice) => {
+        const match =
+          trimmed.length === 0 ||
+          choice.recipeName.toLowerCase().includes(trimmed) ||
+          (choice.itemName ? choice.itemName.toLowerCase().includes(trimmed) : false);
+        return { choice, match };
+      });
+      const matchCount = scored.filter((entry) => entry.match).length;
+      scored.sort((a, b) => {
+        if (a.match === b.match) {
+          return a.choice.index - b.choice.index;
+        }
+        return a.match ? -1 : 1;
+      });
+      const orderedEntries =
+        trimmed.length > 0 && matchCount > 0 && matchCount < scored.length
+          ? [...scored.filter((entry) => entry.match), ...scored.filter((entry) => !entry.match)]
+          : [...scored];
+      filteredChoices = orderedEntries.map((entry) => entry.choice);
+
+      displayIndexToChoiceIndex = [];
+      choiceIndexToDisplayIndex = [];
+      const displayItems: string[] = [];
+      const addEntry = (entry: (typeof orderedEntries)[number], choiceIndex: number) => {
+        displayItems.push(entry.choice.label);
+        displayIndexToChoiceIndex.push(choiceIndex);
+        choiceIndexToDisplayIndex[choiceIndex] = displayItems.length - 1;
+      };
+
+      if (trimmed.length > 0 && matchCount > 0 && matchCount < scored.length) {
+        for (let i = 0; i < matchCount; i += 1) {
+          const entry = orderedEntries[i];
+          if (entry) {
+            addEntry(entry, i);
+          }
+        }
+        const divider = "────────────";
+        displayItems.push(divider);
+        displayIndexToChoiceIndex.push(null);
+        for (let i = matchCount; i < orderedEntries.length; i += 1) {
+          const entry = orderedEntries[i];
+          if (entry) {
+            addEntry(entry, i);
+          }
+        }
+      } else {
+        for (let i = 0; i < orderedEntries.length; i += 1) {
+          const entry = orderedEntries[i];
+          if (entry) {
+            addEntry(entry, i);
+          }
+        }
+      }
+
+      list.setItems(displayItems);
+      const listItems = (list as unknown as { items?: Widgets.BlessedElement[] }).items ?? [];
+      for (let i = 0; i < listItems.length; i += 1) {
+        const item = listItems[i];
+        const choiceIndex = displayIndexToChoiceIndex[i];
+        if (!item) {
+          continue;
+        }
+        if (choiceIndex === null || choiceIndex === undefined) {
+          item.style = {
+            ...(item.style ?? {}),
+            fg: "yellow",
+            bold: false,
+          };
+          (item as unknown as { dirty?: boolean }).dirty = true;
+          continue;
+        }
+        const entry = orderedEntries[choiceIndex];
+        const isMuted = trimmed.length > 0 && !entry?.match;
+        item.style = {
+          ...(item.style ?? {}),
+          fg: "white",
+          bold: trimmed.length > 0 ? !isMuted : false,
+        };
+        (item as unknown as { dirty?: boolean }).dirty = true;
+      }
+
+      const previousKey = previousSelection ? choiceKey(previousSelection) : null;
+      const previousMatch = orderedEntries.find(
+        (entry) => previousKey && choiceKey(entry.choice) === previousKey,
+      )?.match;
+      const firstMatchIndex = orderedEntries.findIndex((entry) => entry.match);
+
+      let nextIndex = 0;
+      if (trimmed.length === 0) {
+        if (!userMovedSelection && baseSelectionKey) {
+          const restoredIndex = filteredChoices.findIndex(
+            (choice) => choiceKey(choice) === baseSelectionKey,
+          );
+          if (restoredIndex >= 0) {
+            nextIndex = restoredIndex;
+          }
+        } else if (previousKey) {
+          const previousIndex = filteredChoices.findIndex(
+            (choice) => choiceKey(choice) === previousKey,
+          );
+          if (previousIndex >= 0) {
+            nextIndex = previousIndex;
+          }
+        }
+        baseSelectionKey = null;
+      } else if (previousKey && previousMatch) {
+        const previousIndex = filteredChoices.findIndex(
+          (choice) => choiceKey(choice) === previousKey,
+        );
+        if (previousIndex >= 0) {
+          nextIndex = previousIndex;
+        }
+      } else if (firstMatchIndex >= 0) {
+        nextIndex = firstMatchIndex;
+      }
+
+      isAutoSelecting = true;
+      const displayIndex = choiceIndexToDisplayIndex[nextIndex] ?? 0;
+      list.select(Math.max(0, displayIndex));
+      isAutoSelecting = false;
+
+      renderSearch(matchCount, scored.length);
+      this.screen.render();
+    };
+
     const run = async () => {
-      const choice = plannerChoices[(list as unknown as { selected: number }).selected ?? 0];
+      const selectedDisplayIndex = (list as unknown as { selected?: number }).selected ?? 0;
+      const choiceIndex =
+        displayIndexToChoiceIndex[selectedDisplayIndex] ??
+        displayIndexToChoiceIndex.find((value) => value !== null);
+      if (displayIndexToChoiceIndex[selectedDisplayIndex] === null) {
+        return;
+      }
+      const choice =
+        choiceIndex !== null && choiceIndex !== undefined
+          ? filteredChoices[choiceIndex]
+          : undefined;
       if (!choice) {
         return;
       }
@@ -567,51 +1096,102 @@ export class IndustrialistApp {
       await this.runPlannerWizard(recipe, choice.outputItemId);
     };
 
-    this.bindViewKey(["q"], () => this.showHome());
-    this.bindViewKey(["p"], run);
-    list.key(["enter"], () => {
-      void run();
+    this.bindViewKey(["enter"], run);
+    this.bindViewKey(["escape"], () => this.showHome());
+    this.bindViewKeypress((ch, key) => {
+      if (key.full) {
+        const fullLower = key.full.toLowerCase();
+        const ctrlBackspaceVariants = new Set([
+          "c-backspace",
+          "c-bs",
+          "c-?",
+          "c-h",
+        ]);
+        if (ctrlBackspaceVariants.has(fullLower)) {
+          if (searchQuery.length > 0) {
+            searchQuery = "";
+            applyFilter();
+          }
+          return;
+        }
+      }
+      if (key.meta) {
+        return;
+      }
+      const isClearShortcut =
+        (key.ctrl && (key.name === "u" || key.name === "w" || key.name === "backspace")) ||
+        key.sequence === "\x17" ||
+        key.sequence === "\x08";
+      if (isClearShortcut) {
+        if (searchQuery.length > 0) {
+          searchQuery = "";
+          applyFilter();
+        }
+        return;
+      }
+      if (["up", "down", "k", "j", "enter", "escape", "tab"].includes(key.name ?? "")) {
+        return;
+      }
+      if (key.name === "backspace") {
+        if (searchQuery.length > 0) {
+          searchQuery = searchQuery.slice(0, -1);
+          applyFilter();
+        }
+        return;
+      }
+      if (typeof ch === "string" && ch.length === 1 && ch >= " ") {
+        searchQuery += ch;
+        applyFilter();
+      }
     });
+    this.bindWrapNavigation(list as unknown as Widgets.ListElement, 0, () => {
+      if (!isAutoSelecting && hasActiveSearch) {
+        userMovedSelection = true;
+      }
+    });
+    list.on("select", () => {
+      if (!isAutoSelecting && hasActiveSearch) {
+        userMovedSelection = true;
+      }
+      const selectedDisplayIndex = (list as unknown as { selected?: number }).selected ?? 0;
+      if (displayIndexToChoiceIndex[selectedDisplayIndex] === null) {
+        const fallbackIndex =
+          displayIndexToChoiceIndex.findIndex((value) => value !== null) ?? 0;
+        if (fallbackIndex >= 0) {
+          list.select(fallbackIndex);
+          this.screen.render();
+        }
+      }
+    });
+    applyFilter();
     list.focus();
     this.screen.render();
   }
 
   private async runPlannerWizard(rootRecipe: Recipe, rootOutputItemId?: string): Promise<void> {
-    const supportsOutputPlanning = typeof rootOutputItemId === "string";
-    let targetMode: PlannerRequest["targetMode"] = "machineCount";
-
-    if (supportsOutputPlanning) {
-      const targetModeIndex = await this.promptChoice("Target mode", [
-        "Machine count",
-        "Output per second",
-      ]);
-      if (targetModeIndex === null) {
-        this.showPlannerView();
-        return;
-      }
-      targetMode = targetModeIndex === 0 ? "machineCount" : "outputPerSecond";
+    let resolvedOutputItemId = rootOutputItemId;
+    if (!resolvedOutputItemId && rootRecipe.outputs.length > 0) {
+      resolvedOutputItemId = rootRecipe.outputs[0]?.itemId;
     }
-
-    const targetValue = await this.promptInput(
-      targetMode === "machineCount" ? "Desired machine count" : "Desired output per second",
-      "1",
-    );
-    if (!targetValue) {
-      this.showPlannerView();
-      return;
-    }
+    const targetMode: PlannerRequest["targetMode"] = "machineCount";
+    const targetValue = "1";
 
     const request: PlannerRequest = {
       rootRecipeId: rootRecipe.id,
       targetMode,
       targetValue,
       recipeSelections: {},
-      ...(rootOutputItemId ? { rootOutputItemId } : {}),
+      ...(resolvedOutputItemId ? { rootOutputItemId: resolvedOutputItemId } : {}),
     };
+    this.lastPlannerRequest = request;
 
     while (true) {
       try {
         const result = planFactory(this.catalog, request);
+        this.lastPlannerRequest = {
+          ...request,
+          recipeSelections: { ...result.selections },
+        };
         this.lastResult = result;
         this.showResults(result);
         return;
@@ -634,7 +1214,11 @@ export class IndustrialistApp {
         }
 
         const message =
-          error instanceof PlannerError ? error.message : "Unexpected planner failure.";
+          error instanceof PlannerError
+            ? error.message
+            : error instanceof Error
+              ? `Unexpected planner failure: ${error.message}`
+              : `Unexpected planner failure: ${String(error)}`;
         await this.showMessage("Planner Error", message);
         this.showPlannerView();
         return;
@@ -643,23 +1227,59 @@ export class IndustrialistApp {
   }
 
   private showResults(result: PlannerResult): void {
+    this.setActiveView("results");
     this.clearViewBindings();
     this.clearBody();
     this.setChrome(
       "Results",
-      "up/down move  space/enter toggle  a all  x clear  p planner  q home",
+      "up/down move  space/enter toggle  a all  x clear  t target  s caps  p planner  q home",
     );
 
     const resultKey = createChecklistResultKey(result);
     let checklistItems = buildChecklistItems(result, this.checklistStore.load(resultKey));
     const rootRecipe = getRecipeById(this.catalog, result.rootRecipeId);
+    const contentLeft = 1;
+    const contentTop = 1;
+    const bodyWidth = Number(
+      (this.body as unknown as { width?: number | string }).width ?? this.screen.width,
+    );
+    const contentWidth = Math.max(10, bodyWidth - 2);
+    const headerHeight = 4;
+    const headerLeft = 1;
+    const headerWidth = Math.max(10, contentWidth - 1);
+    const upperTop = contentTop + headerHeight + 1;
+    const upperHeight = "50%-4";
+    const lowerTop = "50%+2";
+    const lowerHeight = "50%-4";
+    const columnGap = 1;
+    const upperLeftWidth = Math.max(
+      10,
+      Math.floor((contentWidth - columnGap) * 0.6),
+    );
+    const upperRightWidth = Math.max(
+      10,
+      contentWidth - columnGap - upperLeftWidth - 2,
+    );
+    const upperRightLeft = contentLeft + upperLeftWidth + columnGap;
+    const lowerLeftWidth = Math.max(
+      10,
+      Math.floor((contentWidth - columnGap) * 0.41),
+    );
+    const lowerRightWidth = Math.max(
+      10,
+      contentWidth - columnGap - lowerLeftWidth - 2,
+    );
+    const lowerRightLeft = contentLeft + lowerLeftWidth + columnGap;
     blessed.box({
       parent: this.body,
-      top: 0,
-      left: 0,
-      width: "100%",
-      height: 4,
+      top: contentTop,
+      left: headerLeft,
+      width: headerWidth,
+      height: headerHeight,
       tags: true,
+      padding: {
+        right: 1,
+      },
       content:
         (result.rootOutputItemId
           ? `{bold}${rootRecipe?.name ?? result.rootRecipeId}{/bold} for {bold}${result.rootOutputItemLabel}{/bold}\n` +
@@ -672,14 +1292,14 @@ export class IndustrialistApp {
 
     blessed.listtable({
       parent: this.body,
-      top: 4,
-      left: 0,
-      width: "60%",
-      height: "50%-2",
+      top: upperTop,
+      left: contentLeft,
+      width: upperLeftWidth,
+      height: upperHeight,
       border: "line",
       label: " Process Order ",
       data: [
-        ["Machine", "Item", "Exact", "Scaled", "Rate/sec"],
+        ["Machine", "Item", "Exact", "Scaled", "Rate/sec", "Net i/s"],
         ...result.processRows.map((row) =>
           row.kind === "machine"
             ? [
@@ -688,6 +1308,7 @@ export class IndustrialistApp {
                 row.exactMachineCount.toFractionString(),
                 row.scaledMachineCount.toString(),
                 row.isConsumption ? "n/a" : row.outputPerSecond.toDecimalString(4),
+                formatNetRate(result.itemNetRates[row.itemId] ?? Rational.zero()),
               ]
             : [
                 "",
@@ -695,6 +1316,7 @@ export class IndustrialistApp {
                 row.exactRate.toFractionString(),
                 row.scaledRate.toDecimalString(4),
                 "external",
+                formatNetRate(result.itemNetRates[row.itemId] ?? Rational.zero()),
               ],
         ),
       ],
@@ -708,12 +1330,12 @@ export class IndustrialistApp {
 
     blessed.listtable({
       parent: this.body,
-      top: 4,
-      left: "60%",
-      width: "40%",
-      height: "50%-2",
+      top: upperTop,
+      left: upperRightLeft,
+      width: upperRightWidth,
+      height: upperHeight,
       border: "line",
-      label: " External Sources ",
+      label: " External ",
       data: [
         ["Item", "Exact/sec", "Scaled/sec"],
         ...result.externalSources.map((source) => [
@@ -732,14 +1354,14 @@ export class IndustrialistApp {
 
     const checklist = blessed.list({
       parent: this.body,
-      top: "50%+2",
-      left: 0,
-      width: "42%",
-      height: "50%-2",
+      top: lowerTop,
+      left: contentLeft,
+      width: lowerLeftWidth,
+      height: lowerHeight,
       border: "line",
       label: " Checklist ",
-      keys: true,
-      vi: true,
+      keys: false,
+      vi: false,
       mouse: true,
       style: {
         selected: {
@@ -748,12 +1370,12 @@ export class IndustrialistApp {
       },
     });
 
-    blessed.box({
+    const dependencyTree = blessed.box({
       parent: this.body,
-      top: "50%+2",
-      left: "42%",
-      width: "58%",
-      height: "50%-2",
+      top: lowerTop,
+      left: lowerRightLeft,
+      width: lowerRightWidth,
+      height: lowerHeight,
       border: "line",
       label: " Dependency Tree ",
       scrollable: true,
@@ -761,8 +1383,34 @@ export class IndustrialistApp {
       keys: true,
       vi: true,
       mouse: true,
-      content: this.renderDependencyTree(result),
     });
+
+    const buildCheckedMachineMap = () => {
+      const checkedById = new Map<string, boolean>();
+      for (let index = 0; index < result.processRows.length; index += 1) {
+        const row = result.processRows[index];
+        if (!row) {
+          continue;
+        }
+        const id = createChecklistItemId(row);
+        checkedById.set(id, Boolean(checklistItems[index]?.checked));
+      }
+
+      const checkedMachineRows = new Map<string, boolean>();
+      for (const row of result.processRows) {
+        if (row.kind !== "machine") {
+          continue;
+        }
+        const id = createChecklistItemId(row);
+        const key = `${row.recipeId}:${row.itemId}`;
+        checkedMachineRows.set(key, checkedById.get(id) ?? false);
+      }
+      return checkedMachineRows;
+    };
+
+    const renderDependencyTree = () => {
+      dependencyTree.setContent(this.renderDependencyTree(result, buildCheckedMachineMap()));
+    };
 
     const getSelectedChecklistIndex = () =>
       Math.max(
@@ -791,6 +1439,7 @@ export class IndustrialistApp {
       if (checklistItems.length > 0) {
         checklist.select(getSelectedChecklistIndex());
       }
+      renderDependencyTree();
       this.screen.render();
     };
 
@@ -821,12 +1470,129 @@ export class IndustrialistApp {
 
     this.bindViewKey(["q"], () => this.showHome());
     this.bindViewKey(["p"], () => this.showPlannerView());
+    this.bindViewKey(["s"], async () => {
+      if (!this.lastPlannerRequest) {
+        await this.showMessage("No Plan", "Run the planner first.");
+        return;
+      }
+
+      const capChoices = this.getRecipeCapChoices(result);
+      if (capChoices.length === 0) {
+        await this.showMessage("No Machines", "This plan has no machines to cap.");
+        return;
+      }
+
+      const existingCaps = this.lastPlannerRequest.perRecipeCaps ?? {};
+      const selected = await this.promptMultiSelect(
+        "Cap machines (space to toggle)",
+        capChoices.map((choice) => choice.label),
+        capChoices.map((choice) => Boolean(existingCaps[choice.recipeId])),
+      );
+      if (!selected) {
+        return;
+      }
+
+      const perRecipeCaps: Record<string, string> = {};
+      for (let index = 0; index < capChoices.length; index += 1) {
+        if (!selected[index]) {
+          continue;
+        }
+        const choice = capChoices[index];
+        const currentCap = existingCaps[choice.recipeId] ?? "1";
+        const capValue = await this.promptInput(
+          `Cap for ${choice.label}`,
+          currentCap,
+        );
+        if (capValue === null) {
+          return;
+        }
+        if (capValue.trim()) {
+          perRecipeCaps[choice.recipeId] = capValue.trim();
+        }
+      }
+
+      const request: PlannerRequest = {
+        ...this.lastPlannerRequest,
+        ...(Object.keys(perRecipeCaps).length > 0 ? { perRecipeCaps } : {}),
+        recipeSelections: { ...this.lastPlannerRequest.recipeSelections },
+      };
+      if (Object.keys(perRecipeCaps).length === 0) {
+        delete request.perRecipeCaps;
+      }
+
+      try {
+        const updated = planFactory(this.catalog, request);
+        this.lastPlannerRequest = {
+          ...request,
+          recipeSelections: { ...updated.selections },
+        };
+        this.lastResult = updated;
+      this.showResults(updated);
+      } catch (error) {
+        const message =
+          error instanceof PlannerError ? error.message : "Unexpected planner failure.";
+        await this.showMessage("Planner Error", message);
+      }
+    });
+    this.bindViewKey(["t"], async () => {
+      if (!this.lastPlannerRequest) {
+        await this.showMessage("No Plan", "Run the planner first.");
+        return;
+      }
+
+      const supportsOutputPlanning = Boolean(
+        this.lastPlannerRequest.rootOutputItemId ?? result.rootOutputItemId,
+      );
+      let targetMode: PlannerRequest["targetMode"] = "machineCount";
+
+      if (supportsOutputPlanning) {
+        const targetModeIndex = await this.promptChoice("Target mode", [
+          "Machine count",
+          "Output per second",
+        ]);
+        if (targetModeIndex === null) {
+          return;
+        }
+        targetMode = targetModeIndex === 0 ? "machineCount" : "outputPerSecond";
+      }
+
+      const targetValue = await this.promptInput(
+        targetMode === "machineCount" ? "Desired machine count" : "Desired output per second",
+        this.lastPlannerRequest.targetValue ?? "1",
+      );
+      if (!targetValue) {
+        return;
+      }
+
+      const request: PlannerRequest = {
+        ...this.lastPlannerRequest,
+        targetMode,
+        targetValue,
+        recipeSelections: { ...this.lastPlannerRequest.recipeSelections },
+      };
+
+      try {
+        const updated = planFactory(this.catalog, request);
+        this.lastPlannerRequest = {
+          ...request,
+          recipeSelections: { ...updated.selections },
+        };
+        this.lastResult = updated;
+        this.showResults(updated);
+      } catch (error) {
+        const message =
+          error instanceof PlannerError ? error.message : "Unexpected planner failure.";
+        await this.showMessage("Planner Error", message);
+      }
+    });
     this.bindViewKey(["space", "enter"], () => toggleSelectedChecklistItem());
     this.bindViewKey(["a"], () => setAllChecklistItems(true));
     this.bindViewKey(["x"], () => setAllChecklistItems(false));
 
     renderChecklist();
     checklist.focus();
+    this.bindWrapNavigation(checklist as unknown as Widgets.ListElement);
+    this.bindViewResize(() => this.showResults(result));
   }
 
   private formatProcessItem(row: ProcessMachineRow): string {
@@ -836,7 +1602,10 @@ export class IndustrialistApp {
     return `${row.itemLabel} (+${row.byproducts.map((byproduct) => byproduct.itemLabel).join(", ")})`;
   }
 
-  private renderDependencyTree(result: PlannerResult): string {
+  private renderDependencyTree(
+    result: PlannerResult,
+    checkedMachineRows: Map<string, boolean>,
+  ): string {
     const lines: string[] = [];
     const visited = new Set<string>();
 
@@ -858,8 +1627,22 @@ export class IndustrialistApp {
         : [];
 
       const indent = "  ".repeat(depth);
+      const itemLabel = output?.itemLabel ?? "consumption";
+      const machineKey = `${recipeId}:${output?.itemId ?? `consumption:${recipeId}`}`;
+      const isChecked = checkedMachineRows.get(machineKey) ?? false;
+      if (isChecked) {
+        if (depth === 0) {
+          lines.push(
+            `${indent}${recipe.machineName} [${itemLabel}${byproducts.length > 0 ? ` + ${byproducts.join(", ")}` : ""}] x${summary.scaledMachineCount.toString()} [x]`,
+          );
+        } else {
+          lines.push(`${indent}${recipe.machineName} [${itemLabel}] [x]`);
+        }
+        return;
+      }
+
       lines.push(
-        `${indent}${recipe.machineName} [${output?.itemLabel ?? "consumption"}${byproducts.length > 0 ? ` + ${byproducts.join(", ")}` : ""}] x${summary.scaledMachineCount.toString()}`,
+        `${indent}${recipe.machineName} [${itemLabel}${byproducts.length > 0 ? ` + ${byproducts.join(", ")}` : ""}] x${summary.scaledMachineCount.toString()}`,
       );
 
       for (const edge of result.dependencyGraph[recipeId] ?? []) {
@@ -874,7 +1657,18 @@ export class IndustrialistApp {
           continue;
         }
 
-        lines.push(`${itemIndent}${getCompactItemLabel(this.catalog, edge.itemId)}`);
+        const edgeLabel = getCompactItemLabel(this.catalog, edge.itemId);
+        const edgeKey = `${edge.producerRecipeId}:${edge.itemId}`;
+        const edgeChecked = checkedMachineRows.get(edgeKey) ?? false;
+        if (edgeChecked) {
+          const producerRecipe = getRecipeById(this.catalog, edge.producerRecipeId);
+          lines.push(
+            `${itemIndent}${producerRecipe?.machineName ?? edgeLabel} [${edgeLabel}] [x]`,
+          );
+          continue;
+        }
+
+        lines.push(`${itemIndent}${edgeLabel}`);
         const key = `${recipeId}->${edge.producerRecipeId}:${edge.itemId}`;
         if (!visited.has(key)) {
           visited.add(key);
@@ -885,6 +1679,16 @@ export class IndustrialistApp {
 
     visit(result.rootRecipeId, 0, result.rootOutputItemId);
     return lines.join("\n");
+  }
+
+  private getRecipeCapChoices(result: PlannerResult): Array<{ recipeId: string; label: string }> {
+    return result.recipeSummaries.map((summary) => {
+      const outputLabel = summary.outputsPerSecond[0]?.itemLabel ?? "consumption";
+      return {
+        recipeId: summary.recipeId,
+        label: `${outputLabel} via ${summary.machineName}`,
+      };
+    });
   }
 
   private async addItem(): Promise<void> {
@@ -901,6 +1705,7 @@ export class IndustrialistApp {
       id: makeStableId(name, this.catalog.items.map((item) => item.id)),
       name,
       aliases: parseAliases(aliasesInput),
+      showInPlanner: true,
     });
     this.persistCatalog();
   }
@@ -923,7 +1728,8 @@ export class IndustrialistApp {
     this.persistCatalog();
   }
 
-  private async deleteItem(item: Item): Promise<void> {
+  private async deleteItem(item: Item): Promise<boolean> {
+    const beforeLength = this.catalog.items.length;
     const used = this.catalog.recipes.some(
       (recipe) =>
         recipe.outputs.some((output) => output.itemId === item.id) ||
@@ -931,13 +1737,21 @@ export class IndustrialistApp {
     );
     if (used) {
       await this.showMessage("Cannot Delete", "This item is still used by one or more recipes.");
-      return;
+      return false;
     }
-    if (!(await this.confirm(`Delete item "${item.name}"?`))) {
-      return;
+    const choice = await this.promptChoice(`Delete item "${item.name}"?`, [
+      "Delete item",
+      "Cancel",
+    ]);
+    if (choice !== 0) {
+      return false;
     }
     this.catalog.items = this.catalog.items.filter((entry) => entry.id !== item.id);
     this.persistCatalog();
+    if (this.catalog.items.length !== beforeLength) {
+      this.showCatalog();
+    }
+    return true;
   }
 
   private async addRecipe(): Promise<void> {
@@ -972,12 +1786,21 @@ export class IndustrialistApp {
     this.persistCatalog();
   }
 
-  private async deleteRecipe(recipe: Recipe): Promise<void> {
-    if (!(await this.confirm(`Delete recipe "${recipe.name}"?`))) {
-      return;
+  private async deleteRecipe(recipe: Recipe): Promise<boolean> {
+    const beforeLength = this.catalog.recipes.length;
+    const choice = await this.promptChoice(`Delete recipe "${recipe.name}"?`, [
+      "Delete recipe",
+      "Cancel",
+    ]);
+    if (choice !== 0) {
+      return false;
     }
     this.catalog.recipes = this.catalog.recipes.filter((entry) => entry.id !== recipe.id);
     this.persistCatalog();
+    if (this.catalog.recipes.length !== beforeLength) {
+      this.showCatalog();
+    }
+    return true;
   }
 
   private async collectRecipeFields(existing?: Recipe): Promise<Omit<Recipe, "id"> | null> {
@@ -1082,6 +1905,14 @@ function parseAliases(raw: string): string[] {
     .split(",")
     .map((value) => value.trim())
     .filter(Boolean);
+}
+
+function formatNetRate(rate: Rational): string {
+  if (rate.isZero()) {
+    return "0 i/s";
+  }
+  const value = rate.toDecimalString(4);
+  return `${value.startsWith("-") ? value : `+${value}`} i/s`;
 }
 
 export function createAppWithDefaultStore(): IndustrialistApp {

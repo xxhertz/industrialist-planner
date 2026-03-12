@@ -7,6 +7,7 @@ export interface Item {
   id: ItemId;
   name: string;
   aliases: string[];
+  showInPlanner: boolean;
 }
 
 export interface RecipeIngredient {
@@ -34,6 +35,7 @@ export interface PlannerRequest {
   rootOutputItemId?: ItemId;
   targetMode: "machineCount" | "outputPerSecond";
   targetValue: string;
+  perRecipeCaps?: Record<RecipeId, string>;
   recipeSelections: Record<ItemId, RecipeId>;
 }
 
@@ -41,6 +43,7 @@ export interface SerializedItem {
   id: ItemId;
   name: string;
   aliases: string[];
+  showInPlanner?: boolean;
 }
 
 export interface SerializedRecipeIngredient {
